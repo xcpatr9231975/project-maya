@@ -826,6 +826,61 @@ class EngineDeath(unittest.TestCase):
             httpd.server_close()
 
 
+class OutOfMemory(unittest.TestCase):
+    """The memory ran out in the engine: the request failed, the engine lives - so the client gets a 503 (try
+    again), not a 400 (the request was wrong)."""
+
+    def test_a_memory_failure_is_a_503(self):
+        class OomEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                raise ValueError("prefill mmq: the scratch pool wanted 2 MB and could not have it: out of memory")
+
+        tok = ByteTokenizer()
+        svc = Service(OomEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    code, text = r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                with e:
+                    code, text = e.code, e.read().decode()
+            self.assertEqual(code, 503, text)
+            self.assertIn("out of memory", text)
+            self.assertIn("server_error", text)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_another_error_is_a_400(self):
+        class ErrEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                raise ValueError("the prompt has a token outside the vocabulary")
+
+        tok = ByteTokenizer()
+        svc = Service(ErrEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                with e:
+                    code = e.code
+            self.assertEqual(code, 400)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class PromptProgressStream(unittest.TestCase):
     """`return_progress: true` on a streamed chat completion: while the prompt is read, the stream carries chunks
     with a top-level `prompt_progress` object (llama.cpp's field, its four values), so a client can show a prefill

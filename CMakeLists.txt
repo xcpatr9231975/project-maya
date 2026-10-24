@@ -885,6 +885,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # the allocation failures the recovery recognizes: a prompt-path failure ends the request, not the process
+  # (header-only, no library to link)
+  add_executable(prefill_failure_test src/prefill/failure_test.cpp)
+  target_include_directories(prefill_failure_test PRIVATE include)
+  add_test(NAME prefill_failure_test COMMAND prefill_failure_test)
 endif()
 
 set(_strata_cpu_sources src/kernels/cpu/pool.cpp src/kernels/cpu/expert_layout.cpp

@@ -26,6 +26,17 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
   idle-read timeout for a request's headers and body (`MAYA_HTTP_READ_TIMEOUT_S`, 30 s) bound a stuck client: a body
   that stops is answered 408 and a request over the handler limit is answered 503 with `Retry-After: 1`, instead of a
   connection that waits for ever.
+- **An allocation failure no longer ends the engine.** The prompt path's own checks (its kernel launches, the MMQ
+  kernels, the prefill GEMMs) and the MMQ scratch pool's allocation used to end the process - `std::exit(1)` and
+  `std::abort()` - so an out-of-memory moment took the engine down, the client got a 503 and the next request waited
+  for it to load again. A failure is now thrown and caught at the request: the request ends with an error, the engine
+  lives, the next request runs. Where the failure is a layout that does not fit, the prompt is read again with a
+  smaller chunk (down to 256 tokens) and stays that small for the requests that follow; a failure in the middle of a
+  chunk (the scratch pool, a verify window's first use) ends the request and the next one reads its prompt again.
+  Only a broken CUDA context still ends the engine. The server answers 503 for a memory failure (the client can try
+  again) and 400 for a request that was wrong. `STRATA_PREALLOC_FAIL=<tokens>` and `STRATA_MMQ_POOL_FAIL=<n>` make
+  the two failures happen on purpose; `tools/test_alloc_recovery.py` runs them and checks that the engine answers
+  the next request.
 
 ## v1.1.26 - 2026-10-23
 

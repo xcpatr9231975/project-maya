@@ -296,6 +296,16 @@ class EngineDied(RuntimeError):
 # the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
 NONFINITE = "non-finite"
 
+# the engine's ERR when the memory ran out (the prompt path's layout, its scratch pool): the request failed, the
+# engine lives and the next one runs - so this is a 503 (try again), not a 400 (the request was wrong)
+OUTOFMEMORY = ("out of memory", "does not fit", "do not fit", "not enough memory", "not enough space")
+
+
+def out_of_memory(why: str) -> bool:
+    """Whether the engine's error is a memory failure (the engine lives: the request can be tried again)."""
+    low = str(why).lower()
+    return any(p in low for p in OUTOFMEMORY)
+
 
 def client_stop_strings(req: dict | None) -> list[str]:
     """A request's own stop strings: OpenAI's "stop" (a string or a list) or Anthropic's "stop_sequences" (from
@@ -3584,7 +3594,12 @@ def make_handler(svc: Service):
             except (JobError, StoreBusy) as e:
                 self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                if out_of_memory(str(e)):
+                    # the memory ran out: the engine lives (the next request reads its prompt with a smaller
+                    # chunk), so this is a 503 the client can try again
+                    self._json(503, {"error": {"type": "server_error", "message": f"{e}; the engine is up, try again"}})
+                else:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
             except (KeyError, TypeError, AttributeError, IndexError) as e:

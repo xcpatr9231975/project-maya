@@ -209,11 +209,23 @@ what you changed there):
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
-**Allocation failure recovery (known gap).** Prefill sizing estimates available memory, but cannot guarantee that
-host or GPU allocations will succeed at runtime; a large chunk or later scratch allocation can still exhaust memory.
-The recovery goal is to avoid terminating the inference process: retry with a smaller prefill chunk where it is safe,
-and otherwise return a request-level error. Until that recovery is implemented, reduce `--prefill` or `--max-context`,
-or increase the VRAM reserve when other GPU allocations need headroom.
+**Allocation failure recovery.** Prefill sizing estimates available memory, but cannot guarantee that host or GPU
+allocations will succeed at runtime; a large chunk, or a verify window's first use, can still run out. A failure in
+the prompt path - its layout, its scratch pool, a kernel launch - ends that request with an error instead of ending
+the process: the engine lives and the next request runs, and the server answers `503` (a memory failure is not the
+client's fault, so it can try again) where a request that was wrong gets `400`.
+
+Where the failure happens before anything is computed - the layout of a chunk that does not fit the lendable region -
+the prompt is read again with a smaller chunk, down to 256 tokens, and the chunk stays that small for the requests
+that follow (the log says `the chunk is N tokens now`). A failure in the middle of a chunk (the MMQ scratch pool, a
+verify window's graph) cannot be retried: the request ends, the next one reads its prompt again from token 0. Only a
+broken CUDA context (an illegal memory access, a device-side assert) still ends the engine, because nothing else can
+run on it.
+
+Two settings make the failures happen on purpose, so the recovery can be tested without waiting for the memory to
+run out: `STRATA_PREALLOC_FAIL=<tokens>` fails the layout of a request's chunk above that size, and
+`STRATA_MMQ_POOL_FAIL=<n>` fails the scratch pool's first n allocations. `tools/test_alloc_recovery.py` runs both
+against the installed model and checks that the request fails and the engine answers the next one.
 
 ## The expert pool's size
 
