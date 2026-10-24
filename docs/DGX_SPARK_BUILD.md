@@ -1,5 +1,7 @@
 # The DGX Spark build: what we changed, where it comes from, what others did
 
+*By carlos patriawan, 2026-10-24.*
+
 This page documents the work done on this machine on 2026-10-24: bringing Project Maya up on one NVIDIA DGX Spark
 (GB10), and the changes that took. It says **what every component is** and **where it comes from**, **what other
 people did** that this builds on, and **what the diff actually is** - file by file, with the reason for each change.
