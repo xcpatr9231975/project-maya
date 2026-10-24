@@ -214,3 +214,22 @@ tests: 392 tools and 360 server tests pass.
 - **`ple_parity`** needs the maintainer's fixtures (see above).
 - The last end-to-end re-run of `tools/test_alloc_recovery.py` against the final binary is pending: the GPU's memory
   is held by the DFlash2 server this machine is running.
+
+## 7. Publishing to Hugging Face
+
+Two ready-to-upload payloads live in `docs/`:
+
+| Directory | Repo type | What it holds |
+| --- | --- | --- |
+| `docs/hf-maya-s-v2-dgx-spark-README.md` | `--type model` | the run's card: the numbers, the llama.cpp comparison, the machine, and `base_model` pointing at the project's weights repo (the 90 GB of GGUF is **not** re-hosted - it already lives at `peasantsmith/GLM-5.3-Flash-Maya-GGUF`) |
+| `docs/hf-dataset/` | `--type dataset` | the benchmark as data: `bench.csv` (47 rows, one per measurement, with the command that produced it), `maya-bench.txt` (the engine's own `--bench` output) and `BENCHMARK.md` |
+
+```sh
+huggingface-cli login                                  # token from huggingface.co -> Settings -> Access Tokens
+huggingface-cli repo create Maya-S-v2-IQ2_XXS-DGX-Spark --type model
+huggingface-cli upload xcpatr922JNP/Maya-S-v2-IQ2_XXS-DGX-Spark \
+    docs/hf-maya-s-v2-dgx-spark-README.md README.md
+
+huggingface-cli repo create maya-dgx-spark-bench --type dataset
+huggingface-cli upload xcpatr922JNP/maya-dgx-spark-bench docs/hf-dataset/* .
+```
