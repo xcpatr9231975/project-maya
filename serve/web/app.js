@@ -858,8 +858,10 @@ function renderAbout(eng, hw, st, storage) {
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
-    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+    ["Speculation", eng.dflash ? "DFlash2: a small drafter proposes up to 7 tokens a round, the full model checks them"
+                  : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
+    ["Answers at once", +eng.parallel > 1 ? `up to ${fmt(eng.parallel)} requests at once (--parallel ${eng.parallel})` : null],
     ["Images", eng.images ? "on" : "off"],
   ]);
   const gpus = hw.gpus || [];

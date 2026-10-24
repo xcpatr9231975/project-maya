@@ -6,8 +6,11 @@ the desktop all share the same 120 GB. This page is what a bring-up needs to kno
 had to change, and what is still missing.
 
 Measured on one DGX Spark (see [Measured](#measured)): **16.8 tokens/s** decoding, **730 tokens/s** reading an
-8K-token prompt, every expert resident, a 99.97% cache hit. [BENCHMARK.md](../BENCHMARK.md) has the numbers at every
-token size, and the same model on the same GPU with upstream llama.cpp.
+8K-token prompt, every expert resident, a 99.97% cache hit. The config this setup installs also drafts with a
+DFlash2 drafter, which takes the decode to **21.1 tokens/s** (greedy; see
+[Drafting and several requests](#drafting-dflash2-and-several-requests-at-once)), and a second config answers four
+requests at once for 1.80x the tokens in all. [BENCHMARK.md](../BENCHMARK.md) has the numbers at every token size,
+and the same model on the same GPU with upstream llama.cpp.
 
 What the aarch64 port changed, where each component of the build comes from, and what other people's work it stands
 on are in [DGX_SPARK_BUILD.md](DGX_SPARK_BUILD.md).
@@ -75,6 +78,10 @@ The engine answers on an OpenAI-compatible API and serves a dashboard:
 `serve-maya.sh` finds a server it did not start (one a supervisor or a hand started), so `status` and `stop` work
 whatever started it. The first start reads ~86 GB of experts: about 40 s to load them and warm the tiers, and the
 first answers wait for that.
+
+The default config drafts with DFlash2; the parallel-4 config (four requests at once, no drafting) is started with
+`MAYA_CONFIG=$PWD/maya-maya-s-v2-iq2_xxs-parallel4.json ./serve-maya.sh` - stop the running one first, they are the
+same model ([Drafting and several requests](#drafting-dflash2-and-several-requests-at-once)).
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -157,7 +164,9 @@ takes none at all (`glm fast: CUDA0 CPU lane off: the RAM tier holds no expert`)
 ## Measured
 
 `./maya.sh --bench` with Maya stopped (the standard measurement: three greedy answers of 256 tokens with the
-thinking off, and a prompt read at 2048 and 8192 tokens):
+thinking off, and a prompt read at 2048 and 8192 tokens). This is the baseline without drafting - the config this
+setup installs drafts with DFlash2, which takes the decode to 21.1 tokens/s
+([Drafting and several requests](#drafting-dflash2-and-several-requests-at-once)):
 
 ```
 Project Maya v1.1.26 benchmark, 2026-10-24 11:36
@@ -180,6 +189,83 @@ pool at 8.7 GB/s at the start (86 GB in 10 s), and the decode is bound by the ke
 These numbers match the DGX Spark row in the README's table (16.5 tokens/s, ~730 tokens/s on a 6K prompt, reported
 by @ericoh88 on v1.1.15).
 
+## Drafting (DFlash2) and several requests at once
+
+The pack this setup uses (Maya-S-v2-IQ2_XXS) has no MTP draft block, so a plain install decodes token by token. Two
+ways to get more out of the machine were measured here. **They are mutually exclusive**: with `--parallel` above 1 the
+several-conversation scheduler decodes without the drafter (`src/program/generate.cpp`: `glm dflash: not used with
+MAYA_GLM_SEQS=%d`), so each lives in its own config and only one runs at a time.
+
+### DFlash2 - the default config
+
+`./maya.sh --setup --draft dflash2 --no-vision` downloads the drafter (0.7 GB,
+[on Hugging Face](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF); license CC BY-NC-ND 4.0, non-commercial
+use only) and writes `--dflash <GGUF>` into the config's `"args"`. A GB10 (sm_121) is eligible - DFlash2 is offered on
+NVIDIA from sm_80 (RTX 30 / A100) on. The setup then runs the speed calibration, which measured both sides here (the
+model loaded twice, 1536 tokens a side after a warm-up, the config's own sampling):
+
+| | sustained (tokens/s) | |
+| --- | ---: | --- |
+| no drafting | 16.1 | |
+| DFlash2 | 17.4 | +8%, 92% of the drafts accepted |
+
+`./maya.sh --bench` (greedy, the engine alone, thinking off): **decode mean 21.1 tokens/s** over three 256-token
+answers against 16.8 without it (+26%); prefill is unchanged (614 / 732 tokens/s at 2048 / 8192 against 597 / 730) -
+the drafter only changes decode. The greedy gain is the larger one because every draft is then accepted. The drafter
+costs nothing here: the pool is sized from `MemAvailable`, and every expert still fits beside it (12 096 of 12 096,
+the RAM tier staging only):
+
+```
+glm dflash: 5 layers, hidden 4096, 32 heads (8 kv), block 8, window 2048, selector top-16 rank 256,
+            reads trunk layers 6,15,25,34,43; 717 MB on CUDA0
+glm fast: CUDA0 all experts fit in the GPU pool; RAM tier is staging only
+```
+
+The result is kept in the config (`installer.speed_calibration`: the two speeds, the kept choice), so a start does not
+measure again by itself; `./maya.sh --speed-calibration` measures again at any time (the GPUs to itself, 5-20
+minutes).
+
+### Several requests at once - the parallel-4 config
+
+`--parallel 4` answers up to four requests at once: a token of each goes through the model together, so every dense
+weight is read once for all of them. It is a second config, `maya-maya-s-v2-iq2_xxs-parallel4.json` (the same
+arguments, `--parallel 4`, no `--dflash` - the drafter is not used with it - and its own engine log), started with:
+
+```sh
+MAYA_CONFIG=$PWD/maya-maya-s-v2-iq2_xxs-parallel4.json ./serve-maya.sh
+```
+
+Measured with the engine's own multi bench (`STRATA_GLM_MULTI_BENCH=4,512,256`: four synthetic 512-token prompts,
+256 greedy tokens each, sequence 0 alone first as the reference):
+
+| | tokens/s | |
+| --- | ---: | --- |
+| one request alone | 17.2 | |
+| four at once, together | 30.9 | 1.80x in all, 7.7 each |
+| the tokens | 256 of 256 the same | each request gets what it would get alone |
+
+Each extra request keeps its own context state, taken from the expert pool (the start log's `glm multi:` line gives
+the size): with four running, the VRAM hit was 99.8% and a token saw 0.67 disk reads, against 99.97% and 0.09 for one
+- a few more experts live outside the pool, which is what the aggregate gain is paid from.
+
+### Which one to run
+
+- One request at a time (a chat, an agent, `opencode`): the default config - DFlash2 drafts, 21.1 tokens/s greedy.
+- Several at once (agents with workers, several people): the parallel-4 config - 30.9 tokens/s in all for four, no
+  drafting (a request alone still runs at 17.2).
+- `./serve-maya.sh stop` before switching: the two configs are the same model, so only one can hold the GPU.
+
+## What was tried on this machine (the enhancement log)
+
+| | | |
+| --- | --- | --- |
+| DFlash2 drafter | **done** | +8% sampled / +26% greedy decode, the same answers; the default config drafts now |
+| `--parallel 4` | **done** | 1.80x for four at once, identical tokens; the second config |
+| Vision | not used | `--no-vision`: the encoder builds for sm_121, but its 1.1 GB of files and ~320 MB on the GPU buy nothing here |
+| The 27-29 s load | skipped | agreed not worth the work: only the first start is slower, the steady state is not |
+| Prefill at short prompts (0.96x at 256-512 tokens) | skipped | the advantage was uncertain, and the work is engine-level |
+| The Q2_0 and EXL3 kernels on NEON | skipped | they unlock other packs on ARM, not this setup's |
+
 ## Still missing
 
 - **The canonical Q2_0 pack** is x86-only. Maya-S-v2-IQ2_XXS (a native pack) works; a Q2_0 pack does not, and the
@@ -192,11 +278,13 @@ by @ericoh88 on v1.1.15).
        have
        set up its GGUF instead: ./maya.sh --setup --model DeepSeek-V4.1-Flash-1017 --ds4-quant gguf-q8
   ```
-- **The image encoder** builds for aarch64 (`tools/vision`, CUDA sm_121), but its files (1.1 GB) are not part of the
-  setup used here - `--no-vision` skips them. The engine reads text only in this configuration.
-- **No allocation-failure recovery.** The prefill sizing estimates the memory, but an allocation can still fail at
-  runtime; the recovery (a smaller chunk, or a request-level error instead of a dead process) is not implemented yet.
-  See [docs/SETTINGS.md](SETTINGS.md#the-expert-pools-size) for the settings that move the pool's bounds.
+- **The image encoder** builds for aarch64 (`tools/vision`, CUDA sm_121) and its files exist, but this setup
+  deliberately leaves it out (`--no-vision`): 1.1 GB of files and ~320 MB on the GPU for pictures this box does not
+  need. Drop the flag and re-run the setup to have it.
+- **Allocation failures no longer end the engine** (the CHANGELOG's Unreleased section has the details): a failure
+  in the prompt path ends that request with an error (503) and the next one runs, and where the layout does not fit
+  the prompt is read again with a smaller chunk (down to 256 tokens). On a unified device that matters most - an
+  out-of-memory moment no longer costs the ~40 s reload and the expert cache rebuild.
 - **`ple_parity`** (a C++ test) needs the maintainer's fixtures - the Qwen3.8-Flash-Next GGUF and
   `bench/micro/ple_*.bin` - and fails without them on any machine, not only here.
 

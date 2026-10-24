@@ -22,7 +22,17 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
 - **A benchmark at several token sizes** (`tools/bench_tokens.py`): the prompt read at 256-32768 tokens with the time
   to its first token, and the answer written at 32-1024 tokens. [BENCHMARK.md](BENCHMARK.md) has the numbers on a
   DGX Spark and the same model on the same GPU with upstream llama.cpp: Maya reads a prompt up to 3.2x faster there,
-  and its decode is a tie at a short context and 3-7% faster at a long one.
+  and with the DFlash2 drafter the config drafts with its decode is 1.2-1.4x faster (a tie at a short context and
+  3-7% faster at a long one without it).
+- **The DFlash2 drafter and four requests at once on a DGX Spark** ([docs/DGX_SPARK.md](docs/DGX_SPARK.md)): the
+  pack this setup uses has no MTP draft block, so `--setup --draft dflash2` downloads the drafter (0.7 GB, CC
+  BY-NC-ND 4.0) and the speed calibration keeps it where it is faster - on a DGX Spark 17.4 against 16.1 tokens/s
+  sampled (+8%, 92% of the drafts accepted) and 21.1 against 16.8 greedy (+26%), every expert still resident beside
+  the drafter's 717 MB, prefill unchanged. `--parallel 4` is the other side of the same choice (the
+  several-conversation scheduler decodes without the drafter): a second config (`maya-maya-s-v2-iq2_xxs-parallel4.json`,
+  started with `MAYA_CONFIG=`) answers four requests at once for 1.80x the tokens in all - 30.9 against 17.2
+  tokens/s - each request's tokens the ones it would get alone. The dashboard's About page says which one runs
+  (Speculation: DFlash2 or MTP; Answers at once: up to N).
 - **The server's connection limits:** the number of active request handlers (`MAYA_HTTP_MAX_CONNECTIONS`, 64) and the
   idle-read timeout for a request's headers and body (`MAYA_HTTP_READ_TIMEOUT_S`, 30 s) bound a stuck client: a body
   that stops is answered 408 and a request over the handler limit is answered 503 with `Retry-After: 1`, instead of a

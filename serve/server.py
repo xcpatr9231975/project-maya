@@ -1999,6 +1999,7 @@ class Service:
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+                  "parallel": int(getattr(self.engine, "multi", 0) or 0),   # (--parallel N: answers at once)
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}
         with self.status_lock:
