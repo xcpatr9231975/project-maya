@@ -302,7 +302,8 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   conversation checkpoints, the layer-split search, the expert profile and the CPU expert kernels, and for
   `maya-ds4` the 3.5-bit EXL3 option, tensor parallel over 4 / 8 GPUs and the threaded expert-cache swaps (#276). Thanks also to everyone who sent code and speed reports
   ([contributors](https://github.com/mw00/project-maya/graphs/contributors)).
-- **carlos patriawan** ([@xcpatr9231975](https://github.com/xcpatr9231975)) brought Maya up on a single NVIDIA DGX
+- **carlos patriawan** ([@xcpatr9231975](https://github.com/xcpatr9231975) on GitHub,
+  [xcpatr922JNP](https://huggingface.co/xcpatr922JNP) on Hugging Face) brought Maya up on a single NVIDIA DGX
   Spark (GB10): the aarch64 port (the portable CPU kernels and ggml-cpu's NEON paths, the ARM spin and store fence,
   and the unified-memory expert pool on a device whose memory is the system's), the setup's ARM handling, the
   server's connection limits, and the prompt path's allocation-failure recovery. The numbers are in
