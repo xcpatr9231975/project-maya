@@ -187,6 +187,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
+- **NVIDIA DGX Spark / Grace (aarch64, the GPU's memory is the system's):** [docs/DGX_SPARK.md](docs/DGX_SPARK.md).
 - **Updating:** the dashboard's **About > Update**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 

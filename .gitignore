@@ -58,5 +58,10 @@ build-vision.bat
 /.serve-maya.pid
 /serve-maya.out.log
 
+# the local benchmark and report (./maya.sh --bench, ./maya.sh --report)
+/maya-bench.txt
+/maya-bench.log
+/maya-report.txt
+
 # the agent's own workspace
 /.opencode/

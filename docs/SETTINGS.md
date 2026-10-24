@@ -244,7 +244,8 @@ leaves `MAYA_GLM_RAM_HEADROOM_GB` (16 GB on these) for the system and the reserv
 is allocated later, and the start says what it took (`glm fast: CUDA0 unified memory: MemAvailable ... GB, headroom
 ... GB + ... MB reserve, experts need ... GB, pool budget ... GB`). Nothing is checked after the pool is written (the
 free figure moves with the page cache), so the start fails only if the pool cannot hold one route's experts in every
-layer - then it says how much more it needs.
+layer - then it says how much more it needs. A DGX Spark's bring-up is in
+[docs/DGX_SPARK.md](DGX_SPARK.md).
 
 ## Repeatable answers
 

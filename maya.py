@@ -1007,6 +1007,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
             fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
                  f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
         return check_hip_pc(a)
+    if ds4 and not gguf and S.ARM:
+        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
+        fail(f"{DS4}'s EXL3 quant needs the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
+             f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
     min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MIN_CC

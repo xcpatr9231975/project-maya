@@ -15,6 +15,9 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
   counts the model's page cache as used), the spin-wait hints and the store fence are the ARM ones (`yield`,
   `dmb oshst`), and the CPU feature checks answer "no AVX-512" instead of running an illegal instruction. A DGX Spark
   (121 GB of shared memory) holds Maya-S at a 128K context and answers at 15-17 tokens/s with a 99.7% expert cache hit.
+  The bring-up is in [docs/DGX_SPARK.md](docs/DGX_SPARK.md).
+- **The DeepSeek EXL3 quants on an ARM CPU** are refused by the setup (their expert kernels are x86-only), with the
+  GGUF quant offered instead.
 - **The server's connection limits:** the number of active request handlers (`MAYA_HTTP_MAX_CONNECTIONS`, 64) and the
   idle-read timeout for a request's headers and body (`MAYA_HTTP_READ_TIMEOUT_S`, 30 s) bound a stuck client: a body
   that stops is answered 408 and a request over the handler limit is answered 503 with `Retry-After: 1`, instead of a
