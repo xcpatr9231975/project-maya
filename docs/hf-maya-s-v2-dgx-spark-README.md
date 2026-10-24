@@ -1,6 +1,5 @@
 ---
 license: mit
-license_name: mit
 library_name: transformers
 pipeline_tag: text-generation
 language:
@@ -14,18 +13,36 @@ tags:
 - dgx-spark
 - gb10
 - inference
-base_model: zai-org/GLM-5.3-Flash
+- benchmark
+base_model:
+- peasantsmith/GLM-5.3-Flash-Maya-GGUF
+- zai-org/GLM-5.3-Flash
 ---
 
-# Maya-S v2 IQ2_XXS - a DGX Spark (aarch64) run of Project Maya
+# Maya-S v2 IQ2_XXS on a DGX Spark (aarch64) - numbers and build notes
 
-A 2.06-bit quant of **GLM-5.3-Flash** (320 B parameters, ~18 B active per token), run on **one NVIDIA DGX Spark
-(GB10, 20 ARM cores, 120 GB of RAM shared with the GPU)** with
+**This repository does not host the weights.** It is the record of one run: the 2.06-bit quant of GLM-5.3-Flash on a
+single NVIDIA DGX Spark (GB10, 20 ARM cores, 120 GB of RAM shared with the GPU), with
 [Project Maya](https://github.com/mw00/project-maya)'s engine.
 
-This card is the record of that run: the numbers, what the machine is, and where every part of the build comes from.
-The engine's own write-up is [BENCHMARK.md](https://github.com/mw00/project-maya/blob/main/BENCHMARK.md) and
-[docs/DGX_SPARK_BUILD.md](https://github.com/mw00/project-maya/blob/main/docs/DGX_SPARK_BUILD.md).
+## Where the weights are
+
+The GGUF this ran is **already on Hugging Face**:
+
+- repo: **[peasantsmith/GLM-5.3-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)**
+  (folder `Maya-S-v2-IQ2_XXS`, revision `main`, MIT)
+- 3 shards, 89.83 GiB, 2.0625 bpw:
+  `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-0000{1,2,3}-of-00003.gguf`
+- the original weights: **[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (MIT)
+
+```sh
+huggingface-cli download peasantsmith/GLM-5.3-Flash-Maya-GGUF \
+    --include "Maya-S-v2-IQ2_XXS/*.gguf" --local-dir ./Maya-S-v2-IQ2_XXS
+```
+
+The quant: error-feedback-rounded IQ2_XXS gate/up experts, IQ2_S / IQ3_XXS down projections, Q6_K attention and the
+MTP draft block, made from Z.ai's FP8 release by Project Maya. The SHA-256 of each shard is verified by the
+project's own setup (`maya.py`).
 
 ## Numbers (one DGX Spark, greedy, thinking off)
 
@@ -39,8 +56,8 @@ The engine's own write-up is [BENCHMARK.md](https://github.com/mw00/project-maya
 | Context | 131 072 tokens (the model supports 1 M) |
 | Model size | 89.83 GiB, 2.0625 bpw |
 
-Measured with `./maya.sh --bench` (three 256-token greedy answers, thinking off) and
-`tools/bench_tokens.py` (the sweep across prompt and answer sizes).
+Measured with `./maya.sh --bench` (three 256-token greedy answers, thinking off) and `tools/bench_tokens.py` (the
+sweep across prompt and answer sizes).
 
 ### Against upstream llama.cpp, on the same GPU and the same weights
 
@@ -73,8 +90,14 @@ keeps a RAM tier and a disk tier below the pool.
 | --- | --- |
 | Engine | [Project Maya](https://github.com/mw00/project-maya) v1.1.26 + the aarch64 port |
 | Tensor library | [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), pinned at `3cf03257` - the quant formats, ggml-cpu's NEON dot products (the expert kernels on aarch64) and the prompt path's MMQ kernels |
-| Model weights | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) by zai-org (MIT) |
-| Quant | `Maya-S-v2-IQ2_XXS`, 89.83 GiB in three GGUF shards, packed with the project's own `tools/iq_pack.py` |
+| The aarch64 port | [docs/DGX_SPARK.md](https://github.com/mw00/project-maya/blob/main/docs/DGX_SPARK.md), [docs/DGX_SPARK_BUILD.md](https://github.com/mw00/project-maya/blob/main/docs/DGX_SPARK_BUILD.md) |
+| The benchmark | [BENCHMARK.md](https://github.com/mw00/project-maya/blob/main/BENCHMARK.md) |
+
+```sh
+git clone https://github.com/mw00/project-maya && cd project-maya
+./maya.sh --setup --yes --gpu 0 --context 131072 --no-vision --download-model
+./serve-maya.sh start        # http://127.0.0.1:8080/v1 (OpenAI-compatible)
+```
 
 ## Credits
 
@@ -90,5 +113,5 @@ keeps a RAM tier and a disk tier below the pool.
 
 ## Licence
 
-MIT, like the projects above. The notices of ggml / llama.cpp and of Project Maya stay with every copy; the model
-weights keep zai-org's MIT licence.
+MIT, like the projects above. This repository holds documentation and measurements only; the weights keep their
+own licences (the quant: MIT, from peasantsmith's repo; the originals: zai-org's MIT).
