@@ -148,6 +148,10 @@ Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the 
 slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a
 [GitHub issue](https://github.com/mw00/project-maya/issues).
 
+[BENCHMARK.md](BENCHMARK.md) has the numbers at several token sizes on one DGX Spark, and the same model on the same
+GPU with upstream llama.cpp: Maya reads a prompt up to 3.2x faster there, and its decode is a tie at a short context
+and 3-7% faster at a long one.
+
 **DeepSeek-V4.1-Flash-1017** (`maya-ds4`):
 
 | Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |

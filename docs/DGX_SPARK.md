@@ -6,7 +6,8 @@ the desktop all share the same 120 GB. This page is what a bring-up needs to kno
 had to change, and what is still missing.
 
 Measured on one DGX Spark (see [Measured](#measured)): **16.8 tokens/s** decoding, **730 tokens/s** reading an
-8K-token prompt, every expert resident, a 99.97% cache hit.
+8K-token prompt, every expert resident, a 99.97% cache hit. [BENCHMARK.md](../BENCHMARK.md) has the numbers at every
+token size, and the same model on the same GPU with upstream llama.cpp.
 
 ## The machine
 
