@@ -45,7 +45,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_GLM_EXPERT_HELPER` | unset (off) | Experimental native-GGUF expert helper: the visible GPU index (`1`, not a Boolean). GPU 0 keeps the trunk and MTP; the helper owns a complementary expert cache, with heat-coordinated replacement and GPU quantization/reduction. Use `MAYA_GLM_SPLIT=0`, without `--layer-split`; unset this variable to disable. UMA helpers alias the pinned RAM tier; discrete helpers use their VRAM. See [AMD helper setup and scope](AMD_MAYA.md#experimental-expert-helper) |
-| `MAYA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized; it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free. The pinned tier can't be swapped out, so a Linux desktop whose kernel starts swapping with more free (several displays, a busy session) wants more: a 128 GB desktop with three GPUs and three displays stayed responsive at 16, and swapped at 12 (#77) |
+| `MAYA_GLM_RAM_HEADROOM_GB` | 6 (16 on a unified-memory device) | RAM left free for the system when the RAM tier is sized; it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free. The pinned tier can't be swapped out, so a Linux desktop whose kernel starts swapping with more free (several displays, a busy session) wants more: a 128 GB desktop with three GPUs and three displays stayed responsive at 16, and swapped at 12 (#77). On a unified-memory device (a GB10 / Grace, a Ryzen AI Max APU) it also sizes the expert pool: the pool may take that RAM, so the headroom is what is left for the system |
 | `MAYA_GLM_RAM_GB` | from free RAM | a fixed RAM-tier size in GB |
 | `MAYA_GLM_COMPLETE_POOL` | AMD: on | where the GPU's expert budget holds every expert, the 3 spares a layer and the prompt path's borrowed slots (the Ryzen AI Max APUs' memory on Windows - a Radeon 8065S holds Maya-S with ~60 GB to spare), each layer keeps exactly that many: the start loads every expert, a prompt borrows only the slots beyond them (none moved out, none read from the SSD again), the decode never misses and the CPU lane has nothing to take (8065S, Maya-S: decode +2.6-4%, +7% after an 8K-token prompt, the same answers). `0` = off; `1` = on for NVIDIA too (not measured there). Linux APUs keep their unified-memory policy |
 | `MAYA_GLM_RESIDENT_SKIP` | AMD: on | while every expert is in VRAM, the decode leaves out each route's wait and fetch launches, which would find nothing to do (two a layer and token); `0` = launch them anyway; `1` = on for NVIDIA too |
@@ -164,10 +164,12 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_THINK_RESERVE` | 1024 | the server: a thinking block is closed early enough to leave the answer at least this many tokens, or a quarter of the request's `max_tokens` if that is more (the config's `"thinking_budget"` is lowered per request to fit) - a request whose `max_tokens` runs out while the model is still thinking otherwise ends with no answer at all |
 | `MAYA_ENGINE_STALL_S` | 90 | the server: an engine silent this long that also used no CPU, disk or GPU in that time is stuck - it is ended, the request gets an error and the next request starts it again (a silent engine that is working is never ended); `0` = off |
 | `MAYA_WATCHDOG_S` | 180 | the engine: a request that finishes no prompt layer and no token for this long has hung, even with a thread spinning (#40). The engine writes where it stopped to its log (on Windows also `maya-stall-<pid>.dmp`, every thread's stack: attach both to an issue) and ends; the request gets an error and the next request starts it again. `0` = off |
-| `MAYA_HTTP_BACKLOG`, `MAYA_MAX_BODY_MIB` | 256, 256 | the server: connections that may wait to be accepted, and the largest request body in MiB (a larger one gets a 413 before it is read) |
+| `MAYA_HTTP_BACKLOG`, `MAYA_HTTP_MAX_CONNECTIONS`, `MAYA_HTTP_READ_TIMEOUT_S`, `MAYA_MAX_BODY_MIB` | 256, 64, 30, 256 | the server: connections that may wait to be accepted; maximum active request handlers (excess requests get a 503); the idle-read timeout for request headers and bodies in seconds (a stalled body gets a 408); and the largest request body in MiB (a larger one gets a 413 before it is read) |
 | `MAYA_ENGINE_QUIT_S` | 50 | the server: how long the engine gets to end (and keep its conversation, with `MAYA_GLM_SLOT_KEEP`) after a stop - SIGTERM and SIGHUP are handled like Ctrl+C, a second one is ignored (a second Ctrl+C ends the server at once); a supervisor's own grace (llama-swap's `unloadTimeout`) should exceed it |
 | `MAYA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
 | `MAYA_FAIR_SLICE_S` | 0 (off) | the server: an answer that has been decoding this many seconds while another request waits gives the engine to it and continues afterwards, from where it was (the engine keeps its state with what it wrote: one token is read again). Concurrent chats and an agent's side requests no longer wait for a whole answer (4x RTX 4090, a short question during a 3000-token answer: first token after 34 s -> 13-17 s at 15-20). Each switch sets a conversation aside on disk (0.1-1 s up to 100K tokens on a SATA SSD array), so a slow disk wants a longer slice |
+
+The active-handler limit includes requests waiting for the inference engine and streams in progress. Once the request line, headers and body have been read, the read timeout is cleared; it does not limit prompt processing, generation or SSE duration. When all handler slots are occupied, newly accepted connections receive `503 Service Unavailable` with `Retry-After: 1`.
 
 **The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
 first. That profile ranks every (layer, expert) pair, and its order also decides how many VRAM slots each layer
@@ -207,6 +209,12 @@ what you changed there):
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
+**Allocation failure recovery (known gap).** Prefill sizing estimates available memory, but cannot guarantee that
+host or GPU allocations will succeed at runtime; a large chunk or later scratch allocation can still exhaust memory.
+The recovery goal is to avoid terminating the inference process: retry with a smaller prefill chunk where it is safe,
+and otherwise return a request-level error. Until that recovery is implemented, reduce `--prefill` or `--max-context`,
+or increase the VRAM reserve when other GPU allocations need headroom.
+
 ## The expert pool's size
 
 What each GPU's VRAM holds besides the model's dense weights, its context state and the drafter goes to experts (the
@@ -217,9 +225,9 @@ there, and the reserves below, go there too, and a setup again keeps them (`MAYA
 
 | Argument | What it does |
 | --- | --- |
-| `--expert-cache auto` | the default: the pool takes the free VRAM less the reserve. Once that budget is written, the free VRAM is read again: under Windows an allocation counts only once it is touched, the free figure read before it can be about a gigabyte too high, and a card filled past it pages GPU memory to system RAM instead of failing (decode several times slower; a request can stall for good). Short of the reserve, the pool gives back the difference and is checked again; an allocation the driver refuses (Windows also charges VRAM to the commit, RAM + page file) ends it at what the driver gave. Not checked: an APU (Ryzen AI Max: its GPU memory is the system's), and a budget well beyond all the pool can take (every expert with the spares and a prompt's room - it cannot fill the card). `MAYA_GLM_POOL_CHECK=0` skips the check |
+| `--expert-cache auto` | the default: the pool takes the free VRAM less the reserve. Once that budget is written, the free VRAM is read again: under Windows an allocation counts only once it is touched, the free figure read before it can be about a gigabyte too high, and a card filled past it pages GPU memory to system RAM instead of failing (decode several times slower; a request can stall for good). Short of the reserve, the pool gives back the difference and is checked again; an allocation the driver refuses (Windows also charges VRAM to the commit, RAM + page file) ends it at what the driver gave. Not checked: a unified-memory device (its GPU memory is the system's: a Ryzen AI Max APU, a GB10 / Grace), and a budget well beyond all the pool can take (every expert with the spares and a prompt's room - it cannot fill the card). `MAYA_GLM_POOL_CHECK=0` skips the check |
 | `--expert-cache N` | your own size: the first GPU's pool holds at most N experts (N of its largest expert slots); a split's later GPUs stay on `auto`. It is not checked once written: a card it fills too far is only reported at start |
-| `--vram-reserve-mib N` | the VRAM left free beside the pool: 700 MiB by default (1024 on a Ryzen AI Max APU under Linux). On a small card where that would leave the pool less than a route's experts and the spares in every layer, `auto` lowers it as far as 300 MiB and says so; a number set here is kept. The setup takes it too (`--vram-reserve-mib N`) |
+| `--vram-reserve-mib N` | the VRAM left free beside the pool: 700 MiB by default (1024 on a unified-memory device under Linux - a Ryzen AI Max APU, a GB10 / Grace). On a small card where that would leave the pool less than a route's experts and the spares in every layer, `auto` lowers it as far as 300 MiB and says so; a number set here is kept. The setup takes it too (`--vram-reserve-mib N`) |
 | `--vram-reserve-later-mib N` | the same on a split's later GPUs (default: `--vram-reserve-mib`'s) - a card that drives no display needs less |
 
 At start the engine log says how much VRAM each GPU has free with everything loaded (`maya serve: CUDA0: ... MiB of
@@ -228,6 +236,15 @@ leave room. The engine only says so: raise `--vram-reserve-mib` (`--vram-reserve
 close other programs that use the GPU. A drafter's verify windows allocate on first use, after the start: an RTX 3090
 with DFlash2 at 32K had 431 MiB free at start and 77 MiB after the first request - fine on Linux, where a full card
 fails an allocation instead of paging, but on Windows a reason to raise the reserve.
+
+**A unified-memory device** (a GB10 / Grace on CUDA, a Ryzen AI Max APU on HIP) has no VRAM of its own: its memory is
+the system's RAM. The runtime's free figure counts the model's reclaimable page cache as used, so the pool is sized
+from `/proc/meminfo`'s `MemAvailable` instead - the kernel evicts the cache as the experts are read back in. The budget
+leaves `MAYA_GLM_RAM_HEADROOM_GB` (16 GB on these) for the system and the reserve (1024 MiB) for the driver and what
+is allocated later, and the start says what it took (`glm fast: CUDA0 unified memory: MemAvailable ... GB, headroom
+... GB + ... MB reserve, experts need ... GB, pool budget ... GB`). Nothing is checked after the pool is written (the
+free figure moves with the page cache), so the start fails only if the pool cannot hold one route's experts in every
+layer - then it says how much more it needs.
 
 ## Repeatable answers
 

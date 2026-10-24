@@ -4,6 +4,22 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+Maya runs on a single DGX Spark (GB10): the engine builds for aarch64, its expert pool is sized from the memory the
+device shares with the system, and the CPU lane falls back to ggml's NEON kernels.
+
+- **NVIDIA DGX Spark (GB10) and Grace on CUDA:** the engine builds on aarch64 - the x86-only expert kernels are left
+  out and the native packs go through ggml-cpu's own NEON paths - and a device whose memory is the system's gets the
+  AMD APUs' unified-memory policy: the pool is sized from `/proc/meminfo`'s `MemAvailable` (the runtime's free figure
+  counts the model's page cache as used), the spin-wait hints and the store fence are the ARM ones (`yield`,
+  `dmb oshst`), and the CPU feature checks answer "no AVX-512" instead of running an illegal instruction. A DGX Spark
+  (121 GB of shared memory) holds Maya-S at a 128K context and answers at 15-17 tokens/s with a 99.7% expert cache hit.
+- **The server's connection limits:** the number of active request handlers (`MAYA_HTTP_MAX_CONNECTIONS`, 64) and the
+  idle-read timeout for a request's headers and body (`MAYA_HTTP_READ_TIMEOUT_S`, 30 s) bound a stuck client: a body
+  that stops is answered 408 and a request over the handler limit is answered 503 with `Retry-After: 1`, instead of a
+  connection that waits for ever.
+
 ## v1.1.26 - 2026-10-23
 
 DeepSeek reads prompts up to 1.5x faster on NVIDIA V100s and faster on every NVIDIA GPU, its long tool calls stream,

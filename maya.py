@@ -586,6 +586,8 @@ def choose(question: str, intro: list, options: list, default: int, yes: bool, o
 def gpu_label(g) -> str:
     if g.get("vendor") == "amd":
         return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, {g['arch']})"
+    if g.get("unified_memory"):
+        return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB shared with the system)"
     return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
 
 
@@ -1028,6 +1030,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        (f": the model's layers are split across the {len(chosen)}" if len(chosen) > 1 else ""))
+    if any(g.get("unified_memory") for g in chosen):
+        say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
+            "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
     if vram < 23 and not ds4:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
@@ -1120,7 +1125,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              f"managed\" can stay small (8 GB on a 128 GB PC): set a custom size of {need_pf} GB or more - System > "
              "About > Advanced system settings > Performance > Advanced > Virtual memory - and restart")
     cpu, avx2, avx512 = S.cpu_info()
-    if not avx2:
+    if S.ARM:
+        ok(f"CPU: {cpu} (ARM64, {os.cpu_count()} threads; the expert kernels use ggml-cpu's NEON paths)")
+    elif not avx2:
         warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower; "
              "on 2x Xeon E5-2660 v2 it still added ~15% to 4-GPU decode). MAYA_GLM_CPU_LANE=0 turns it off")
     else:
@@ -1382,6 +1389,8 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
              f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
+    if S.ARM and S.arm_cpu_arch():
+        conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
     # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
@@ -2142,6 +2151,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
              "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
              f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
              *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
+    if S.ARM and S.arm_cpu_arch():
+        conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     if meta.get("host_compiler"):
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))

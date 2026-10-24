@@ -1635,6 +1635,55 @@ class RequestBodies(unittest.TestCase):
     def test_the_listen_backlog(self):
         self.assertGreaterEqual(self.httpd.request_queue_size, 256)
 
+
+class HttpResourceLimits(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        self.env = mock.patch.dict(os.environ, {"STRATA_HTTP_MAX_CONNECTIONS": "1",
+                                               "STRATA_HTTP_READ_TIMEOUT_S": "0.2"})
+        self.env.start()
+        tok = ByteTokenizer()
+        svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.env.stop()
+
+    def test_idle_headers_time_out_and_saturated_connections_are_rejected(self):
+        import socket
+        first = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        first.sendall(b"POST /")
+        try:
+            second = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+            with second:
+                self.assertIn(b"503 Service Unavailable", second.recv(1024))
+            self.assertEqual(first.recv(1024), b"")
+        finally:
+            first.close()
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_incomplete_body_times_out_with_408(self):
+        import socket
+        request = (b"POST /v1/chat/completions HTTP/1.0\r\nHost: localhost\r\n"
+                   b"Content-Type: application/json\r\nContent-Length: 10\r\n\r\n")
+        with socket.create_connection(("127.0.0.1", self.port), timeout=2) as client:
+            client.sendall(request)
+            response = b""
+            while True:
+                part = client.recv(4096)
+                if not part:
+                    break
+                response += part
+        self.assertIn(b" 408 ", response.split(b"\r\n", 1)[0])
+        self.assertIn(b"request body timed out", response)
+
+
 class TestCarryEmbeddings(unittest.TestCase):
     def test_the_job_thread_sees_the_request_threads_image_file(self):
         local = threading.local()

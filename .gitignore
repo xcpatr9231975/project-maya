@@ -53,3 +53,10 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# local model-server entrypoint state (serve-maya.sh)
+/.serve-maya.pid
+/serve-maya.out.log
+
+# the agent's own workspace
+/.opencode/

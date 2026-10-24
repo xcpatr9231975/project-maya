@@ -3107,6 +3107,20 @@ def _backlog() -> int:
         return 256
 
 
+def _http_max_connections() -> int:
+    try:
+        return min(1024, max(1, int(os.environ.get("STRATA_HTTP_MAX_CONNECTIONS", "64"))))
+    except ValueError:
+        return 64
+
+
+def _http_read_timeout() -> float:
+    try:
+        return min(300.0, max(0.1, float(os.environ.get("STRATA_HTTP_READ_TIMEOUT_S", "30"))))
+    except ValueError:
+        return 30.0
+
+
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; STRATA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -3157,7 +3171,24 @@ def make_handler(svc: Service):
             self.answer_started = True
             super().send_response(code, message)
 
+        def parse_request(self):
+            try:
+                return super().parse_request()
+            finally:
+                self.connection.settimeout(None)
+
         def _body(self) -> bytes:
+            timeout = self.connection.gettimeout()
+            self.connection.settimeout(_http_read_timeout())
+            try:
+                return self._read_body()
+            except TimeoutError:
+                self.close_connection = True
+                raise BadBody(408, "request body timed out") from None
+            finally:
+                self.connection.settimeout(timeout)
+
+        def _read_body(self) -> bytes:
             """The request body: Content-Length checked first (a bad one is a 400, one over body_limit() a 413 before
             anything is read), or a Transfer-Encoding: chunked one from a relay that does not buffer it."""
             limit = body_limit()
@@ -3897,6 +3928,37 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
 
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(_http_max_connections())
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(_http_read_timeout())
+        return request, client_address
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n"
+                                b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
     def server_close(self):
         service = getattr(self, "response_service", None)
         try:
@@ -3911,7 +3973,8 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
-              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_HTTP_MAX_CONNECTIONS", "STRATA_HTTP_READ_TIMEOUT_S", "STRATA_MAX_BODY_MIB",
+              "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
 
 
