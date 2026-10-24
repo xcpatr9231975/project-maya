@@ -9,6 +9,9 @@ Measured on one DGX Spark (see [Measured](#measured)): **16.8 tokens/s** decodin
 8K-token prompt, every expert resident, a 99.97% cache hit. [BENCHMARK.md](../BENCHMARK.md) has the numbers at every
 token size, and the same model on the same GPU with upstream llama.cpp.
 
+What the aarch64 port changed, where each component of the build comes from, and what other people's work it stands
+on are in [DGX_SPARK_BUILD.md](DGX_SPARK_BUILD.md).
+
 ## The machine
 
 | | |
