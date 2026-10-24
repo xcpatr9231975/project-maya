@@ -15,7 +15,8 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
   counts the model's page cache as used), the spin-wait hints and the store fence are the ARM ones (`yield`,
   `dmb oshst`), and the CPU feature checks answer "no AVX-512" instead of running an illegal instruction. A DGX Spark
   (121 GB of shared memory) holds Maya-S at a 128K context and answers at 15-17 tokens/s with a 99.7% expert cache hit.
-  The bring-up is in [docs/DGX_SPARK.md](docs/DGX_SPARK.md).
+  The bring-up is in [docs/DGX_SPARK.md](docs/DGX_SPARK.md), and what it changed in
+  [docs/DGX_SPARK_BUILD.md](docs/DGX_SPARK_BUILD.md) (carlos patriawan).
 - **The DeepSeek EXL3 quants on an ARM CPU** are refused by the setup (their expert kernels are x86-only), with the
   GGUF quant offered instead.
 - **A benchmark at several token sizes** (`tools/bench_tokens.py`): the prompt read at 256-32768 tokens with the time
@@ -36,7 +37,7 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
   Only a broken CUDA context still ends the engine. The server answers 503 for a memory failure (the client can try
   again) and 400 for a request that was wrong. `STRATA_PREALLOC_FAIL=<tokens>` and `STRATA_MMQ_POOL_FAIL=<n>` make
   the two failures happen on purpose; `tools/test_alloc_recovery.py` runs them and checks that the engine answers
-  the next request.
+  the next request (carlos patriawan).
 
 ## v1.1.26 - 2026-10-23
 
