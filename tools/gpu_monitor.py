@@ -35,13 +35,17 @@ never stays inactive that long.
 """
 
 import ctypes
+import errno
 import fcntl
 import glob
+import math
 import os
+import platform
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -81,15 +85,36 @@ REPORT_KEEP_D = 7                      # days of per-sample reports to keep
 #
 # DEVICE_FREE_FLOOR_MIB 3072 sits above the engine's own "LOW" warning
 # (256 MiB) and above the ~1021 MiB the box was at when it hard-locked.
-GUARD_ENABLED         = os.environ.get("GPU_MONITOR_GUARD", "1") not in ("0", "no", "false")
-DEVICE_FREE_FLOOR_MIB = float(os.environ.get("GPU_MONITOR_DEVICE_FREE_FLOOR_MIB", "3072"))
-MEM_FLOOR_GIB         = float(os.environ.get("GPU_MONITOR_MEM_FLOOR_GIB", "6"))
-GPU_CEIL_MIB          = float(os.environ.get("GPU_MONITOR_GPU_CEIL_MIB", "112640"))
-WARN_FREE_MIB         = float(os.environ.get("GPU_MONITOR_WARN_FREE_MIB", "4096"))
-WARN_FLOOR_GIB        = float(os.environ.get("GPU_MONITOR_WARN_FLOOR_GIB", "12"))
-WARN_EVERY_S          = float(os.environ.get("GPU_MONITOR_WARN_EVERY_S", "300"))
-GUARD_CONSEC_S        = float(os.environ.get("GPU_MONITOR_GUARD_CONSEC_S", "30"))
-GUARD_GRACE_S         = float(os.environ.get("GPU_MONITOR_GUARD_GRACE_S", "30"))
+def _env_float(name, default, *, minimum=0.0, exclusive=False):
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number (got {raw!r})") from exc
+    if not math.isfinite(value) or (value <= minimum if exclusive else value < minimum):
+        relation = "greater than" if exclusive else "at least"
+        raise ValueError(f"{name} must be finite and {relation} {minimum} (got {raw!r})")
+    return value
+
+
+def _env_bool(name, default):
+    raw = os.environ.get(name, default).strip().lower()
+    if raw in ("1", "yes", "true", "on"):
+        return True
+    if raw in ("0", "no", "false", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean value (got {raw!r})")
+
+
+GUARD_ENABLED         = _env_bool("GPU_MONITOR_GUARD", "1")
+DEVICE_FREE_FLOOR_MIB = _env_float("GPU_MONITOR_DEVICE_FREE_FLOOR_MIB", "3072", exclusive=True)
+MEM_FLOOR_GIB         = _env_float("GPU_MONITOR_MEM_FLOOR_GIB", "6", exclusive=True)
+GPU_CEIL_MIB          = _env_float("GPU_MONITOR_GPU_CEIL_MIB", "112640", exclusive=True)
+WARN_FREE_MIB         = _env_float("GPU_MONITOR_WARN_FREE_MIB", "4096")
+WARN_FLOOR_GIB        = _env_float("GPU_MONITOR_WARN_FLOOR_GIB", "12")
+WARN_EVERY_S          = _env_float("GPU_MONITOR_WARN_EVERY_S", "300", exclusive=True)
+GUARD_CONSEC_S        = _env_float("GPU_MONITOR_GUARD_CONSEC_S", "30", exclusive=True)
+GUARD_GRACE_S         = _env_float("GPU_MONITOR_GUARD_GRACE_S", "30", exclusive=True)
 
 # 2026-10-25: two guards against concurrent invocations (see
 # docs/2026-10-25-guard-concurrency.md).  A second invocation running at the
@@ -99,7 +124,7 @@ GUARD_GRACE_S         = float(os.environ.get("GPU_MONITOR_GUARD_GRACE_S", "30"))
 # skips sampling and guard logic entirely.  (2) An armed-age floor: a
 # confirming sample must observe an armed state at least this old, i.e.
 # written by an EARLIER invocation, never a simultaneous one.
-MIN_CONFIRM_AGE_S     = float(os.environ.get("GPU_MONITOR_MIN_CONFIRM_AGE_S", "8"))
+MIN_CONFIRM_AGE_S     = _env_float("GPU_MONITOR_MIN_CONFIRM_AGE_S", "8")
 LOCK_PATH             = os.path.join(HOME, ".gpu_monitor_guard_lock")
 
 # 2026-10-24 additions: two more breach signals and smarter victim choice.
@@ -111,9 +136,9 @@ LOCK_PATH             = os.path.join(HOME, ".gpu_monitor_guard_lock")
 # runaway build, say -- in which case killing the engine is wrong: pick the
 # biggest-RSS process instead.  GPU_MONITOR_PROTECT is a comma list of pids
 # or /proc names the OS-side victim pick will always skip.
-PSI_FULL_FLOOR        = float(os.environ.get("GPU_MONITOR_PSI_FULL_FLOOR", "5.0"))
-SWAP_FLOOR_GIB        = float(os.environ.get("GPU_MONITOR_SWAP_FLOOR_GIB", "8"))
-OS_VICTIM_BY_RSS      = os.environ.get("GPU_MONITOR_OS_VICTIM", "1") not in ("0", "no", "false")
+PSI_FULL_FLOOR        = _env_float("GPU_MONITOR_PSI_FULL_FLOOR", "5.0")
+SWAP_FLOOR_GIB        = _env_float("GPU_MONITOR_SWAP_FLOOR_GIB", "8")
+OS_VICTIM_BY_RSS      = _env_bool("GPU_MONITOR_OS_VICTIM", "1")
 
 # 2026-10-25: RSS-growth attribution for device-free breaches.  On GB10 the
 # device pool IS system RAM, so a process that holds no GPU memory at all --
@@ -126,8 +151,8 @@ OS_VICTIM_BY_RSS      = os.environ.get("GPU_MONITOR_OS_VICTIM", "1") not in ("0"
 # page-noise from framing a bystander; RSS_BASE_MAX_AGE_S discards a stale
 # baseline (monitor was down) rather than mis-attribute.
 RSS_BASE_PATH         = os.path.join(HOME, ".gpu_monitor_guard_rss")
-RSS_BASE_MAX_AGE_S    = float(os.environ.get("GPU_MONITOR_RSS_BASE_MAX_AGE_S", "300"))
-RSS_GROW_MIN_KIB      = float(os.environ.get("GPU_MONITOR_RSS_GROW_MIN_KIB", "262144"))
+RSS_BASE_MAX_AGE_S    = _env_float("GPU_MONITOR_RSS_BASE_MAX_AGE_S", "300", exclusive=True)
+RSS_GROW_MIN_KIB      = _env_float("GPU_MONITOR_RSS_GROW_MIN_KIB", "262144")
 _PROTECT_TOKENS       = {t.strip() for t in
                          os.environ.get("GPU_MONITOR_PROTECT", "").replace(",", " ").split()
                          if t.strip()}
@@ -141,6 +166,40 @@ GUARD_LOG_PATH        = os.path.join(HOME, "gpu_monitor_guard.log")
 # timestamp so the one-shot process can count only NEW kernel-log lines.
 NVRM_PATH             = os.path.join(HOME, ".gpu_monitor_guard_nvrm")
 NVRM_JOURNAL_TIMEOUT  = 10
+
+if MIN_CONFIRM_AGE_S > GUARD_CONSEC_S:
+    raise ValueError("GPU_MONITOR_MIN_CONFIRM_AGE_S must not exceed GPU_MONITOR_GUARD_CONSEC_S")
+if WARN_FREE_MIB < DEVICE_FREE_FLOOR_MIB:
+    raise ValueError("GPU_MONITOR_WARN_FREE_MIB must not be below GPU_MONITOR_DEVICE_FREE_FLOOR_MIB")
+if WARN_FLOOR_GIB < MEM_FLOOR_GIB:
+    raise ValueError("GPU_MONITOR_WARN_FLOOR_GIB must not be below GPU_MONITOR_MEM_FLOOR_GIB")
+
+
+def _atomic_write(path, contents):
+    """Atomically replace a small state file, durably before returning."""
+    directory = os.path.dirname(path) or "."
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix=f".{os.path.basename(path)}.", delete=False) as f:
+            temp_path = f.name
+            f.write(contents)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
 def _q(args, timeout=15):
@@ -315,10 +374,9 @@ def nvrm_errors():
     now = time.time()
     if last is None:
         try:
-            with open(NVRM_PATH, "w") as f:
-                f.write(f"{now}")
+            _atomic_write(NVRM_PATH, f"{now}")
         except OSError:
-            pass
+            return None
         return 0
     if last >= now:
         return 0
@@ -332,10 +390,9 @@ def nvrm_errors():
     if r.returncode != 0:
         return None
     try:
-        with open(NVRM_PATH, "w") as f:
-            f.write(f"{now}")
+        _atomic_write(NVRM_PATH, f"{now}")
     except OSError:
-        pass
+        return None
     return sum(1 for ln in r.stdout.splitlines() if "NV_ERR_NO_MEMORY" in ln)
 
 
@@ -352,16 +409,12 @@ def _state():
     try:
         with open(STATE_PATH) as f:
             return f.read().strip()
-    except OSError:
+    except FileNotFoundError:
         return ""
 
 
 def _set_state(s):
-    try:
-        with open(STATE_PATH, "w") as f:
-            f.write(s)
-    except OSError:
-        pass
+    _atomic_write(STATE_PATH, s)
 
 
 def _warn_due(now):
@@ -444,13 +497,62 @@ def _os_victim(self_pid):
     return best
 
 
-def _signal_pid(pid, sig):
-    """True if the signal was delivered (the process may still be dying)."""
+def _signal_pid(pid, sig, expected_starttime):
+    """Signal only the process instance whose /proc start time was recorded."""
+    pidfd = None
     try:
-        os.kill(int(pid), sig)
+        pidfd = _pidfd_open(int(pid))
+        if _starttime(int(pid)) != expected_starttime:
+            return False
+        _pidfd_send_signal(pidfd, sig)
         return True
     except (ProcessLookupError, OSError, ValueError):
         return False
+    finally:
+        if pidfd is not None:
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+
+
+_PIDFD_SYSCALLS = {
+    # Linux assigns these syscall numbers on both supported 64-bit ABIs.
+    "aarch64": (434, 424),
+    "x86_64": (434, 424),
+}
+
+
+def _pidfd_open(pid):
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid, 0)
+    syscall_numbers = _PIDFD_SYSCALLS.get(platform.machine().lower())
+    if not sys.platform.startswith("linux") or syscall_numbers is None:
+        raise OSError(errno.EOPNOTSUPP, "pidfd_open is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    result = libc.syscall(ctypes.c_long(syscall_numbers[0]), ctypes.c_int(pid),
+                          ctypes.c_uint(0))
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return int(result)
+
+
+def _pidfd_send_signal(pidfd, sig):
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(pidfd, sig)
+        return
+    syscall_numbers = _PIDFD_SYSCALLS.get(platform.machine().lower())
+    if not sys.platform.startswith("linux") or syscall_numbers is None:
+        raise OSError(errno.EOPNOTSUPP, "pidfd_send_signal is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    result = libc.syscall(ctypes.c_long(syscall_numbers[1]), ctypes.c_int(pidfd),
+                          ctypes.c_int(sig), ctypes.c_void_p(), ctypes.c_uint(0))
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 _LAST_RSS = None      # {pid: rss_kib} of this sample, written by memory_guard
@@ -594,21 +696,22 @@ def _try_lock():
     The lock makes every state-file and baseline read-modify-write
     single-threaded across invocations.  flock is released by the kernel
     when the fd is closed or the holder dies, so a SIGKILLed run can never
-    wedge the next sample.
+    wedge the next sample.  Returns False only when another invocation owns
+    the lock; lock setup errors raise instead of running the guard unlocked.
     """
     global _LOCK_FD
-    try:
-        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
-        return True          # cannot lock -> run unlocked rather than blind
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            os.close(fd)
+            return False
         try:
             os.close(fd)
         except OSError:
             pass
-        return False
+        raise
     _LOCK_FD = fd
     return True
 
@@ -654,7 +757,8 @@ def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
     One invocation is one sample, so the two-sample confirmation has to live
     in the state file:
         armed:<ts>            first breach, waiting for a confirming sample
-        termed:<pid>:<ts>     SIGTERM sent, waiting for exit / grace expiry
+        termed:<pid>:<starttime>:<ts>
+                              SIGTERM sent, waiting for exit / grace expiry
     """
     if not GUARD_ENABLED:
         return None
@@ -667,19 +771,57 @@ def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
     avail  = mem.get("MemAvailable")
     availg = avail / 1048576 if avail is not None else None
     gpu    = sum(p[1] for p in procs)
-    state  = _state().split(":")
+    state = _state().split(":")
+
+    if state[0] == "armed":
+        try:
+            armed_at = float(state[1])
+            valid_state = len(state) == 2 and math.isfinite(armed_at) and armed_at >= 0
+        except (IndexError, ValueError):
+            valid_state = False
+        if not valid_state:
+            guard_log("discarding malformed armed state")
+            _set_state("")
+            state = [""]
+    elif state[0] == "termed":
+        try:
+            valid_state = (
+                len(state) == 4 and state[1].isdigit() and int(state[1]) > 0
+                and int(state[2]) >= 0 and math.isfinite(float(state[3]))
+                and float(state[3]) >= 0
+            )
+        except (IndexError, ValueError):
+            valid_state = False
+        if not valid_state:
+            guard_log("discarding malformed or legacy termed state")
+            _set_state("")
+            state = [""]
+    elif state != [""]:
+        guard_log("discarding unknown guard state")
+        _set_state("")
+        state = [""]
 
     # 1. finish a kill started on an earlier sample -- never block this run
     if state[0] == "termed":
         pid = state[1]
+        expected_starttime = int(state[2])
+        termed_at = float(state[3])
+        if _starttime(int(pid)) != expected_starttime:
+            guard_log(f"pid {pid} no longer matches the guarded process; "
+                      "discarding stale termination state")
+            _set_state("")
+            return "guard:state-reset"
         if not _alive(pid):
             guard_log(f"pid {pid} exited after SIGTERM")
             _set_state("")
             return None
-        if now - float(state[2]) >= GUARD_GRACE_S:
-            if _signal_pid(pid, signal.SIGKILL):
+        if now - termed_at >= GUARD_GRACE_S:
+            if _signal_pid(pid, signal.SIGKILL, expected_starttime):
                 guard_log(f"pid {pid} still alive after "
                           f"{GUARD_GRACE_S:.0f}s -> SIGKILL")
+            else:
+                guard_log(f"pid {pid} was not SIGKILLed: process identity "
+                          "changed or pidfd signaling is unavailable")
             _set_state("")
             return "guard:killed"
         return "guard:draining"
@@ -781,7 +923,11 @@ def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
             _set_state("")
             return None
         pid, mib, name = victim
-        _set_state(f"termed:{pid}:{now}")
+        starttime = _starttime(int(pid))
+        if starttime is None:
+            guard_log(f"pid {pid} exited before it could be signaled")
+            _set_state("")
+            return "guard:term-failed"
         why = []
         if low_free:
             why.append(f"device_free {dfree}MiB < {int(DEVICE_FREE_FLOOR_MIB)}MiB")
@@ -797,8 +943,11 @@ def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
             why.append(f"nvrm {nvrm} NV_ERR_NO_MEMORY since last sample")
         guard_log(f"LOW {'; '.join(why)} -> SIGTERM "
                   f"{name}(pid {pid}, {int(mib)}MiB)")
-        if _signal_pid(pid, signal.SIGTERM):
+        if _signal_pid(pid, signal.SIGTERM, starttime):
+            _set_state(f"termed:{pid}:{starttime}:{now}")
             return "guard:terming"
+        guard_log(f"pid {pid} was not SIGTERM'ed: process identity changed "
+                  "or pidfd signaling is unavailable")
         _set_state("")
         return "guard:term-failed"
 
@@ -818,7 +967,13 @@ def main():
     # Whole-run exclusive lock (2026-10-25): if another invocation is
     # mid-sample, it owns this instant -- skip everything (no sample line,
     # no report, no guard decision) and exit 0 quietly.
-    if not _try_lock():
+    try:
+        acquired = _try_lock()
+    except OSError as exc:
+        print(f"ERROR: cannot acquire GPU monitor guard lock: {exc}",
+              file=sys.stderr)
+        return 1
+    if not acquired:
         return 0
     try:
         return _main_locked()
