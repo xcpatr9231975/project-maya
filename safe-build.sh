@@ -68,8 +68,18 @@ SAFE_FROZEN_MAX_S="${SAFE_FROZEN_MAX_S:-300}"
 CMD=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        -C) SAFE_DIR="$2"; shift 2 ;;
-        -j) SAFE_J="$2"; shift 2 ;;
+        -C)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                printf 'safe-build: -C requires a build directory\n' >&2
+                exit 2
+            fi
+            SAFE_DIR="$2"; shift 2 ;;
+        -j)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                printf 'safe-build: -j requires a positive integer\n' >&2
+                exit 2
+            fi
+            SAFE_J="$2"; shift 2 ;;
         --) shift; CMD=("$@"); break ;;
         *)  CMD+=("$1"); shift ;;
     esac
@@ -82,6 +92,38 @@ fi
 
 if [ ${#CMD[@]} -eq 0 ]; then
     CMD=(ninja -C "$SAFE_DIR" -j "$SAFE_J")
+fi
+
+is_number() {
+    awk -v value="$1" 'BEGIN {
+        if (value !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+    }'
+}
+
+is_positive_integer() {
+    case "$1" in
+        ''|*[!0-9]*|0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+for name in SAFE_FLOOR_GIB SAFE_ABORT_GIB SAFE_SWAP_FLOOR_GIB SAFE_PSI_FULL; do
+    value="${!name}"
+    if ! is_number "$value"; then
+        printf 'safe-build: %s must be a non-negative number (got %s)\n' "$name" "$value" >&2
+        exit 2
+    fi
+done
+for name in SAFE_J SAFE_POLL_S SAFE_DEVICE_FLOOR_MIB SAFE_DEVICE_PROBE_EVERY_S SAFE_FROZEN_MAX_S; do
+    value="${!name}"
+    if ! is_positive_integer "$value"; then
+        printf 'safe-build: %s must be a positive integer (got %s)\n' "$name" "$value" >&2
+        exit 2
+    fi
+done
+if awk -v abort="$SAFE_ABORT_GIB" -v floor="$SAFE_FLOOR_GIB" 'BEGIN {exit !(abort > floor)}'; then
+    printf 'safe-build: SAFE_ABORT_GIB must not exceed SAFE_FLOOR_GIB\n' >&2
+    exit 2
 fi
 
 # --- helpers ------------------------------------------------------------------
@@ -140,13 +182,16 @@ if [ "${SAFE_NO_PREFLIGHT:-0}" != "1" ]; then
     esac
     log "pre-flight: mem_available=${a}GiB swap=${s}GiB device_free=${dfree}GiB"
     ok=1
+    if awk -v swap="$s" -v floor="$SAFE_SWAP_FLOOR_GIB" 'BEGIN {exit !(swap >= floor)}'; then
+        ok=0
+    fi
     case "$d" in
         none) ;;
-        *) awk "BEGIN {exit !($dfree < $SAFE_DEVICE_FLOOR_MIB / 1024)}" && ok=0 ;;
+        *) awk -v free="$dfree" -v floor="$SAFE_DEVICE_FLOOR_MIB" 'BEGIN {exit !(free < floor / 1024)}' && ok=0 ;;
     esac
-    [ "$(awk "BEGIN {exit !($a < $SAFE_FLOOR_GIB)}" && echo x)" ] && ok=0
+    awk -v avail="$a" -v floor="$SAFE_FLOOR_GIB" 'BEGIN {exit !(avail < floor)}' && ok=0
     if [ "$ok" = 0 ]; then
-        log "REFUSED: memory below the freeze floor before starting; do not build now"
+        log "REFUSED: a resource threshold is already breached; do not build now"
         exit 125
     fi
 fi
@@ -167,11 +212,14 @@ fi
 log "watching pid $BUILD_PID (pgid $PGID)"
 
 # --- 2. watchdog loop ----------------------------------------------------------
-FROZEN=0            # seconds the group has been frozen
-FROZED_PID=0        # 0 = running, >0 = we have SIGSTOPped the group
+FROZEN=0            # elapsed seconds the group has been frozen
+FROZEN_SINCE=0
 PSI_STRIKES=0       # consecutive PSI-full samples
 LAST_PROBE=0        # device-free probe bookkeeping (monotonic-ish)
 STOPPED=0
+DEVICE_LOW=0
+DEVICE_FREE_MIB=""
+RECOVERY_STRIKES=0
 
 stop_group()  { kill -STOP  "-$PGID" 2>/dev/null;  STOPPED=1; }
 cont_group()  { kill -CONT  "-$PGID" 2>/dev/null;  STOPPED=0; }
@@ -179,21 +227,26 @@ term_group()  { kill -TERM  "-$PGID" 2>/dev/null;  }
 kill_group()  { kill -KILL  "-$PGID" 2>/dev/null;  }
 
 cleanup() {
-    if [ "$STOPPED" = 1 ]; then
-        cont_group
-    fi
+    [ "$STOPPED" = 1 ] && cont_group
+}
+
+terminate_group() {
+    term_group
     kill -CONT "-$PGID" 2>/dev/null
+    sleep 2
+    kill_group
 }
 # INT must exit: without the exit the script kept looping and the build kept
 # running after a Ctrl-C.  TERM is not trapped at all by default, and an
 # untrapped TERM used to leave the build running unwatched.
-on_int()  { exit 130; }
+on_int()  {
+    log "INT: terminating the build's process group"
+    terminate_group
+    exit 130
+}
 on_term() {
     log "TERM: stopping the build's process group"
-    term_group
-    sleep 2
-    kill -CONT "-$PGID" 2>/dev/null
-    kill_group
+    terminate_group
     exit 124
 }
 trap cleanup EXIT
@@ -216,19 +269,21 @@ while kill -0 "$BUILD_PID" 2>/dev/null; do
             *)  dfree="$(awk '{print $1}' <<<"$d")"
                 dfree_g="$(awk '{printf "%.1f", $1 / 1024}' <<<"$d")"
                 log "telemetry: mem_available=${a}GiB swap=${s}GiB psi_full=${pf:-0}% device_free=${dfree_g}GiB"
-                if [ "$dfree" -lt "$SAFE_DEVICE_FLOOR_MIB" ]; then
-                    freeze_reason="device_free=${dfree}MiB < ${SAFE_DEVICE_FLOOR_MIB}MiB"
-                fi
+                DEVICE_FREE_MIB="$dfree"
+                if [ "$dfree" -lt "$SAFE_DEVICE_FLOOR_MIB" ]; then DEVICE_LOW=1; else DEVICE_LOW=0; fi
                 ;;
         esac
     fi
+    if [ "$DEVICE_LOW" = 1 ]; then
+        freeze_reason="device_free=${DEVICE_FREE_MIB}MiB < ${SAFE_DEVICE_FLOOR_MIB}MiB"
+    fi
 
-    [ "$(awk "BEGIN {exit !($a < $SAFE_FLOOR_GIB)}" && echo x)" ] && \
+    awk -v avail="$a" -v floor="$SAFE_FLOOR_GIB" 'BEGIN {exit !(avail < floor)}' && \
         freeze_reason="${freeze_reason:+$freeze_reason; }mem_available=${a}GiB < ${SAFE_FLOOR_GIB}GiB"
-    [ "$(awk "BEGIN {exit !($s >= $SAFE_SWAP_FLOOR_GIB)}" && echo x)" ] && \
+    awk -v swap="$s" -v floor="$SAFE_SWAP_FLOOR_GIB" 'BEGIN {exit !(swap >= floor)}' && \
         freeze_reason="${freeze_reason:+$freeze_reason; }swap=${s}GiB >= ${SAFE_SWAP_FLOOR_GIB}GiB"
     if [ -n "$pf" ]; then
-        if [ "$(awk "BEGIN {exit !($pf >= $SAFE_PSI_FULL)}" && echo x)" ]; then
+        if awk -v pressure="$pf" -v limit="$SAFE_PSI_FULL" 'BEGIN {exit !(pressure >= limit)}'; then
             PSI_STRIKES=$(( PSI_STRIKES + 1 ))
             if [ "$PSI_STRIKES" -ge 2 ]; then
                 freeze_reason="${freeze_reason:+$freeze_reason; }psi_full=${pf}% x$PSI_STRIKES"
@@ -239,34 +294,36 @@ while kill -0 "$BUILD_PID" 2>/dev/null; do
     fi
 
     if [ "$STOPPED" = 1 ]; then
-        FROZEN=$(( FROZEN + SAFE_POLL_S ))
+        FROZEN=$(( SECONDS - FROZEN_SINCE ))
         if [ -n "$freeze_reason" ] && \
-           [ "$(awk "BEGIN {exit !($a < $SAFE_ABORT_GIB)}" && echo x)" ]; then
+           awk -v avail="$a" -v floor="$SAFE_ABORT_GIB" 'BEGIN {exit !(avail < floor)}'; then
             log "ABORT: while frozen, ${freeze_reason} (abort floor ${SAFE_ABORT_GIB}GiB)"
-            term_group
-            sleep 2
-            kill -CONT "-$PGID" 2>/dev/null
-            kill_group
+            terminate_group
             STATUS=124
             break
         fi
         if [ -z "$freeze_reason" ]; then
-            log "RESUME: memory recovered (avail=${a}GiB swap=${s}GiB)"
-            cont_group
-            FROZEN=0
+            RECOVERY_STRIKES=$(( RECOVERY_STRIKES + 1 ))
+            if [ "$RECOVERY_STRIKES" -ge 2 ]; then
+                log "RESUME: memory recovered (avail=${a}GiB swap=${s}GiB)"
+                cont_group
+                FROZEN=0
+                FROZEN_SINCE=0
+                RECOVERY_STRIKES=0
+            fi
         elif [ "$FROZEN" -ge "$SAFE_FROZEN_MAX_S" ]; then
             log "ABORT: frozen ${FROZEN}s with ${freeze_reason}; terminating the build"
-            term_group
-            sleep 2
-            kill -CONT "-$PGID" 2>/dev/null
-            kill_group
+            terminate_group
             STATUS=124
             break
+        else
+            RECOVERY_STRIKES=0
         fi
     elif [ -n "$freeze_reason" ]; then
         log "FREEZE: ${freeze_reason} -> SIGSTOP the build's process group"
         stop_group
-        FROZEN=0
+        FROZEN_SINCE=$SECONDS
+        RECOVERY_STRIKES=0
     fi
 
     sleep "$SAFE_POLL_S"
@@ -278,8 +335,10 @@ if [ "$STATUS" = 124 ]; then
     log "exit: watchdog aborted the build (rc 124)"
     exit 124
 fi
-if [ "$RC" -eq 139 ]; then
-    log "exit: command died (SIGSEGV or watchdog KILL)"
+if [ "$RC" -eq 137 ]; then
+    log "exit: command died (SIGKILL or watchdog KILL)"
+elif [ "$RC" -eq 139 ]; then
+    log "exit: command died (SIGSEGV)"
 fi
 log "exit: rc=$RC"
 exit "$RC"
