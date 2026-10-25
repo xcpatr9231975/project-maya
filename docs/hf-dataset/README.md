@@ -24,7 +24,8 @@ Speed measurements for **GLM-5.3-Flash** (the `Maya-S-v2-IQ2_XXS` quant, 320 B p
 at 2.0625 bpw) on **one NVIDIA DGX Spark** (GB10, 20 ARM cores, 120 GB of RAM shared with the GPU), taken with two
 independent engines on the same weights and the same machine:
 
-- **Maya** - [Project Maya](https://github.com/mw00/project-maya) v1.1.26 + the aarch64 port
+- **Maya** - [Project Maya](https://github.com/mw00/project-maya) v1.1.26 + the aarch64 port, **with and without the
+  DFlash2 drafter** (`--dflash`, 0.7 GB) so the drafter's effect is measurable
 - **llama.cpp** - upstream master @ `272aad8b9`, the first release with the `glm5-next` architecture, built for
   `sm_121a`
 
@@ -46,6 +47,7 @@ independent engines on the same weights and the same machine:
 | --- | --- |
 | `implementation` | `maya` or `llama.cpp` |
 | `metric` | `prefill` (reading the prompt) or `decode` (writing the answer) |
+| `drafter` | `DFlash2` (the config's drafter) or `none` - llama.cpp ran without one; the model has no MTP draft block, so it has no drafter of its own |
 | `prompt_tokens` | tokens the prompt held (the context the run carried) |
 | `generated_tokens` | tokens generated |
 | `seconds` | wall time for that part |
@@ -53,27 +55,44 @@ independent engines on the same weights and the same machine:
 | `first_token_ms` | time to the first answer token (Maya's prompt sweep only) |
 | `source` | the command that produced the row |
 
+80 rows: Maya with the drafter (32), Maya without it (28), llama.cpp (20).
+
 ## Headline numbers
+
+**With the DFlash2 drafter** (the config this machine runs):
+
+| | Maya | llama.cpp (no drafter) |
+| --- | ---: | ---: |
+| Prefill, 32K-token prompt | 754 tok/s | 239 tok/s (**3.2x**) |
+| Prefill, 8K-token prompt | 744 tok/s | 277 tok/s (**2.7x**) |
+| Prefill, 512-token prompt | 303 tok/s | 314 tok/s (tie) |
+| Decode, 256-token answer, short context | 22.9 tok/s | 17.5-17.8 tok/s (**1.29x**) |
+| Decode, 256-token answer, 2K context | 22.9 tok/s | 15.7 tok/s (**1.46x**) |
+| Decode, 256-token answer, 8K context | 21.1 tok/s | 15.6 tok/s (**1.35x**) |
+| `--bench` (three 256-token answers) | **21.1 tok/s** | - |
+
+**Without the drafter** (the same sweeps, before `--draft dflash2`):
 
 | | Maya | llama.cpp |
 | --- | ---: | ---: |
 | Prefill, 32K-token prompt | 756 tok/s | 239 tok/s (**3.2x**) |
-| Prefill, 8K-token prompt | 746 tok/s | 277 tok/s (**2.7x**) |
-| Prefill, 512-token prompt | 302 tok/s | 314 tok/s (tie) |
 | Decode, short context | 17.4 tok/s | 17.7 tok/s (tie) |
 | Decode, 2K-token context | 16.8 tok/s | 15.7 tok/s (1.07x) |
-| Decode, 9K-token context | 16.1 tok/s | 15.6 tok/s (1.03x) |
+| `--bench` | **16.8 tok/s** | - |
 
-Maya's standard `--bench` on this machine: **16.8 tokens/s** decoding (three 256-token greedy answers, thinking
-off), **597 tokens/s** at a 2048-token prompt and **730 tokens/s** at 8192. Every expert resident
-(12 096 of 12 096, 80.17 GB of the 120 GB shared with the GPU), a 99.97% cache hit.
+The drafter does not change the prompt numbers at all, and its decode gain grows with the answer's length - a round
+drafts up to 7 tokens and one pass checks them all, so 15.8 tokens/s at a 32-token answer (worse than no drafter: its
+fixed cost dominates) but 24.6 at 1024. The setup's speed calibration measured the same document conversation
+sampled: 16.13 without, 17.43 with (**+8%**), above its 5% threshold, so the config keeps the drafter. llama.cpp
+cannot draft here - the model has no MTP block and this build has no DFlash2.
 
 ## How the numbers were taken
 
-- Maya: `./maya.sh --bench` (three greedy 256-token answers, thinking off, and prompts at 2048 / 8192 tokens) and
-  `tools/bench_tokens.py`, which drives the engine alone the way the dashboard starts it - the prompt read at
-  256-32768 tokens with the time to its first token, and answers of 32-1024 tokens after a prompt of 128 / 2048 /
-  8192 tokens.
+- Maya: `./maya.sh --bench` (three greedy 256-token answers, thinking off, and prompts at 2048 / 8192 tokens),
+  `./maya.sh --speed-calibration` (the same document conversation sampled, ~1536 tokens, without and with the
+  drafter) and `tools/bench_tokens.py`, which drives the engine alone the way the dashboard starts it - the prompt
+  read at 256-32768 tokens with the time to its first token, and answers of 32-1024 tokens after a prompt of 128 /
+  2048 / 8192 tokens. Both drafter settings were measured the same way.
 - llama.cpp: its own `llama-bench` (`-p` for prefill, `-n` for decode, 2 repetitions) and `llama-completion` with a
   real prompt, whose log reports the prompt-eval and the decode separately.
 - Greedy decoding throughout (temperature 0), one request at a time, nothing else running on the GPU.

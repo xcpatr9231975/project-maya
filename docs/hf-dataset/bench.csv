@@ -1,48 +1,81 @@
-implementation,metric,prompt_tokens,generated_tokens,seconds,tokens_per_second,first_token_ms,source
-maya,prefill,256,1,1.14,225,1136,tools/bench_tokens.py --prompts sweep
-maya,prefill,512,1,1.7,302,1697,tools/bench_tokens.py --prompts sweep
-maya,prefill,1024,1,2.25,456,2246,tools/bench_tokens.py --prompts sweep
-maya,prefill,2048,1,3.28,625,3278,tools/bench_tokens.py --prompts sweep
-maya,prefill,4096,1,5.82,704,5818,tools/bench_tokens.py --prompts sweep
-maya,prefill,8192,1,10.98,746,10982,tools/bench_tokens.py --prompts sweep
-maya,prefill,16384,1,21.41,765,21410,tools/bench_tokens.py --prompts sweep
-maya,prefill,32768,1,43.35,756,43348,tools/bench_tokens.py --prompts sweep
-maya,decode,128,32,2.03,17.2,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,128,64,3.87,17.6,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,128,128,7.73,17.4,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,128,256,14.71,17.4,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,128,512,29.47,17.4,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,128,1024,59.07,17.3,,tools/bench_tokens.py --answer-prompt 128
-maya,decode,2048,32,2.03,15.7,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,2048,64,3.87,16.5,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,2048,128,7.73,16.6,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,2048,256,15.28,16.8,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,2048,512,30.4,16.8,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,2048,1024,61.04,16.8,,tools/bench_tokens.py --answer-prompt 2048
-maya,decode,8192,128,7.94,16.1,,tools/bench_tokens.py --answer-prompt 8192
-maya,decode,8192,256,15.95,16.1,,tools/bench_tokens.py --answer-prompt 8192
-maya,decode,0,256,15.15,16.9,,maya.sh --bench
-maya,decode,0,256,15.33,16.7,,maya.sh --bench
-maya,decode,0,256,15.15,16.9,,maya.sh --bench
-maya,prefill,2048,0,3.43,597,,maya.sh --bench
-maya,prefill,8192,0,11.22,730,,maya.sh --bench
-llama.cpp,prefill,256,0,1.1,233.6,,llama-bench -p 256 -n 0 -r 2
-llama.cpp,prefill,512,0,1.63,314.4,,llama-bench -p 512 -n 0 -r 2
-llama.cpp,prefill,1024,0,3.27,313.4,,llama-bench -p 1024 -n 0 -r 2
-llama.cpp,prefill,2048,0,6.64,308.4,,llama-bench -p 2048 -n 0 -r 2
-llama.cpp,prefill,4096,0,13.89,294.8,,llama-bench -p 4096 -n 0 -r 2
-llama.cpp,prefill,8192,0,29.52,277.5,,llama-bench -p 8192 -n 0 -r 2
-llama.cpp,prefill,16384,0,62.23,263.3,,llama-bench -p 16384 -n 0 -r 2
-llama.cpp,prefill,32768,0,137.1,239.0,,llama-bench -p 32768 -n 0 -r 2
-llama.cpp,decode,0,32,1.83,17.51,,llama-bench -p 0 -n 32 -r 2
-llama.cpp,decode,0,64,3.61,17.71,,llama-bench -p 0 -n 64 -r 2
-llama.cpp,decode,0,128,7.21,17.75,,llama-bench -p 0 -n 128 -r 2
-llama.cpp,decode,0,256,14.39,17.79,,llama-bench -p 0 -n 256 -r 2
-llama.cpp,decode,0,512,28.86,17.74,,llama-bench -p 0 -n 512 -r 2
-llama.cpp,decode,0,1024,57.92,17.68,,llama-bench -p 0 -n 1024 -r 2
-llama.cpp,prefill,2100,0,7.8,269.1,,llama-completion -f PROMPT.txt -n 256
-llama.cpp,decode,2100,255,16.26,15.68,,llama-completion -f PROMPT.txt -n 256
-llama.cpp,prefill,2708,0,10.23,264.69,,llama-completion -f PROMPT.txt -n 256
-llama.cpp,decode,2708,255,16.42,15.53,,llama-completion -f PROMPT.txt -n 256
-llama.cpp,prefill,9021,0,32.9,274.16,,llama-completion -f PROMPT.txt -n 256
-llama.cpp,decode,9021,255,16.34,15.61,,llama-completion -f PROMPT.txt -n 256
+implementation,metric,drafter,prompt_tokens,generated_tokens,seconds,tokens_per_second,first_token_ms,source
+maya,prefill,DFlash2,256,1,1.15,222,1152,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,512,1,1.69,303,1689,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,1024,1,2.26,452,2264,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,2048,1,3.31,619,3310,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,4096,1,5.78,708,5782,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,8192,1,11.01,744,11008,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,16384,1,21.29,769,21294,tools/bench_tokens.py --prompts sweep
+maya,prefill,DFlash2,32768,1,43.43,754,43433,tools/bench_tokens.py --prompts sweep
+maya,decode,DFlash2,128,32,2.03,15.8,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,128,64,3.49,18.3,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,128,128,5.86,21.8,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,128,256,11.16,22.9,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,128,512,22.46,22.8,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,128,1024,41.64,24.6,,tools/bench_tokens.py --answer-prompt 128
+maya,decode,DFlash2,2048,32,2.02,15.8,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,2048,64,3.48,18.4,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,2048,128,5.91,21.7,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,2048,256,11.2,22.9,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,2048,512,22.51,22.7,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,2048,1024,41.56,24.6,,tools/bench_tokens.py --answer-prompt 2048
+maya,decode,DFlash2,8192,32,2.14,15.0,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,8192,64,3.77,17.0,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,8192,128,6.79,18.8,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,8192,256,12.14,21.1,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,8192,512,23.17,22.1,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,8192,1024,41.48,24.7,,tools/bench_tokens.py --answer-prompt 8192
+maya,decode,DFlash2,0,256,12.31,20.8,,maya.sh --bench
+maya,decode,DFlash2,0,256,14.3,17.9,,maya.sh --bench
+maya,decode,DFlash2,0,256,10.49,24.4,,maya.sh --bench
+maya,prefill,DFlash2,2048,0,3.34,614,,maya.sh --bench
+maya,prefill,DFlash2,8192,0,11.19,732,,maya.sh --bench
+maya,decode,none,8000,1536,95.2,16.13,,maya.sh --speed-calibration
+maya,decode,DFlash2,8000,1536,88.1,17.43,,maya.sh --speed-calibration
+maya,prefill,none,256,1,1.14,225,1136,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,512,1,1.7,302,1697,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,1024,1,2.25,456,2246,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,2048,1,3.28,625,3278,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,4096,1,5.82,704,5818,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,8192,1,10.98,746,10982,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,16384,1,21.41,765,21410,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,prefill,none,32768,1,43.35,756,43348,tools/bench_tokens.py --prompts sweep (no --dflash)
+maya,decode,none,128,32,2.03,17.2,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,128,64,3.87,17.6,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,128,128,7.73,17.4,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,128,256,14.71,17.4,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,128,512,29.47,17.4,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,128,1024,59.07,17.3,,tools/bench_tokens.py --answer-prompt 128 (no --dflash)
+maya,decode,none,2048,32,2.03,15.7,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,2048,64,3.87,16.5,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,2048,128,7.73,16.6,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,2048,256,15.28,16.8,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,2048,512,30.4,16.8,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,2048,1024,61.04,16.8,,tools/bench_tokens.py --answer-prompt 2048 (no --dflash)
+maya,decode,none,8192,128,7.94,16.1,,tools/bench_tokens.py --answer-prompt 8192 (no --dflash)
+maya,decode,none,8192,256,15.95,16.1,,tools/bench_tokens.py --answer-prompt 8192 (no --dflash)
+maya,decode,none,0,256,15.15,16.9,,maya.sh --bench (no --dflash)
+maya,decode,none,0,256,15.33,16.7,,maya.sh --bench (no --dflash)
+maya,decode,none,0,256,15.15,16.9,,maya.sh --bench (no --dflash)
+maya,prefill,none,2048,0,3.43,597,,maya.sh --bench (no --dflash)
+maya,prefill,none,8192,0,11.22,730,,maya.sh --bench (no --dflash)
+llama.cpp,prefill,none,256,0,1.1,233.6,,llama-bench -p 256 -n 0 -r 2
+llama.cpp,prefill,none,512,0,1.63,314.4,,llama-bench -p 512 -n 0 -r 2
+llama.cpp,prefill,none,1024,0,3.27,313.4,,llama-bench -p 1024 -n 0 -r 2
+llama.cpp,prefill,none,2048,0,6.64,308.4,,llama-bench -p 2048 -n 0 -r 2
+llama.cpp,prefill,none,4096,0,13.89,294.8,,llama-bench -p 4096 -n 0 -r 2
+llama.cpp,prefill,none,8192,0,29.52,277.5,,llama-bench -p 8192 -n 0 -r 2
+llama.cpp,prefill,none,16384,0,62.23,263.3,,llama-bench -p 16384 -n 0 -r 2
+llama.cpp,prefill,none,32768,0,137.1,239.0,,llama-bench -p 32768 -n 0 -r 2
+llama.cpp,decode,none,0,32,1.83,17.51,,llama-bench -p 0 -n 32 -r 2
+llama.cpp,decode,none,0,64,3.61,17.71,,llama-bench -p 0 -n 64 -r 2
+llama.cpp,decode,none,0,128,7.21,17.75,,llama-bench -p 0 -n 128 -r 2
+llama.cpp,decode,none,0,256,14.39,17.79,,llama-bench -p 0 -n 256 -r 2
+llama.cpp,decode,none,0,512,28.86,17.74,,llama-bench -p 0 -n 512 -r 2
+llama.cpp,decode,none,0,1024,57.92,17.68,,llama-bench -p 0 -n 1024 -r 2
+llama.cpp,prefill,none,2100,0,7.8,269.1,,llama-completion -f PROMPT.txt -n 256
+llama.cpp,decode,none,2100,255,16.26,15.68,,llama-completion -f PROMPT.txt -n 256
+llama.cpp,prefill,none,2708,0,10.23,264.69,,llama-completion -f PROMPT.txt -n 256
+llama.cpp,decode,none,2708,255,16.42,15.53,,llama-completion -f PROMPT.txt -n 256
+llama.cpp,prefill,none,9021,0,32.9,274.16,,llama-completion -f PROMPT.txt -n 256
+llama.cpp,decode,none,9021,255,16.34,15.61,,llama-completion -f PROMPT.txt -n 256
