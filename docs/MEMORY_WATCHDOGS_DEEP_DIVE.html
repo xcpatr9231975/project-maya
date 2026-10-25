@@ -872,6 +872,49 @@ problem</strong> — memwatch’s leak-trend says “scheduled relaunch is the
 response”; gpu_monitor’s RSS-growth attribution handles the fast case
 and leaves the slow one to the WARN band.</li>
 </ol>
+<h3
+id="why-the-qwen38fn-deployment-never-reaches-its-watchdog-design-level-avoidance-2026-10-25">Why
+the qwen38FN deployment never reaches its watchdog — design-level
+avoidance (2026-10-25)</h3>
+<p>The 2026-10-25 pressure drills against maya-S (four confirmed kills,
+all external <code>python3</code>/<code>sleep</code> growers,
+<code>F:</code> to within ~360 MiB of the floor) raise the question: why
+does the vLLM deployment (<code>vllm-fn-tp1</code>, Qwen3.8-Flash-Next,
+:8009) never hit the <code>NV_ERR_NO_MEMORY</code> hard-lock at all? Not
+because memwatch is better — because the <em>allocator itself is
+capped</em>. Three layers, none of which maya-S currently has:</p>
+<ol type="1">
+<li><strong>Static, pre-allocated pool.</strong> vLLM reserves its
+entire KV-cache pool at startup
+(<code>GPU_MEMORY_UTILIZATION=0.78</code>, budget ≈ 93.4 GiB). During
+serving it never allocates beyond the reservation; requests that do not
+fit are <strong>queued or preempted</strong>, never OOM’d. A static pool
+cannot win an “allocation growth” contest against the driver floor.
+(maya-S is the same shape — 86085 MiB flat all day — which is why the
+guard never named the engine as victim.)</li>
+<li><strong>The hard cgroup ceiling.</strong> The container runs under
+<code>memory.max = budget + HOST_SLACK_GIB</code> (2 GiB) ≤ the
+deployment ceiling (pool 119.7 − OS_RESERVE 16 = 103 GiB). An
+over-allocation <em>fails inside the container</em> instead of
+exhausting the driver. On GB10, device memory <strong>is</strong> system
+RAM, so a cgroup cap on the allocator is a direct bound on driver
+pressure — this is the actual crash-avoider, not the watchdog.</li>
+<li><strong>Margin tuning + watchdog as backstop only.</strong> GMU 0.78
+instead of 0.80 deliberately adds ~2.4 GiB of host margin so
+serving-time MemAvailable stays above memwatch’s <code>FREE_GATE</code>
+(10 GiB); the 2026-09-08 history shows kills firing at avail 9.4–10.2
+GiB when the margin was thinner. The watchdog’s job is the allocators
+<em>outside</em> the engine — it never has to fire for qwen’s own
+allocations.</li>
+</ol>
+<p><strong>The same recipe applied to maya-S</strong>: put the engine
+under a systemd slice with <code>memory.max</code> ≈ pool + slack so a
+runaway engine fails its own allocation gracefully; shrink the
+context/kv ceiling so <code>F:</code> rests at 8+ GiB instead of 4.2
+(the GMU-margin move); make the engine refuse or queue new requests
+below a headroom threshold (vLLM’s preemption semantics). Then the guard
+demotes itself to what memwatch already is for qwen: a backstop for
+<em>external</em> allocators, not the primary defense.</p>
 <h3 id="gaps-future-work">Gaps / future work</h3>
 <ul>
 <li><del>gpu_monitor: pid-reuse mis-attribution window</del> — closed by
@@ -894,6 +937,11 @@ in the header.</li>
 <li>The engine itself is ~10.6 GiB RSS by design — a genuine engine leak
 would self-attribute and get killed; correct trade, but remember
 it.</li>
+<li>maya-S runs uncapped — no container, no cgroup, so every process on
+the box can push the driver toward its floor and the guard is the
+<em>only</em> defense. The qwen38FN layers above (cgroup ceiling, GMU
+margin, queue/preempt instead of grow) are the candidate design fix;
+adopting any of them is future work.</li>
 </ul>
 <hr />
 <p><em>Companion sources: maya repo commits <code>dd37817</code>,
@@ -907,6 +955,10 @@ MiaAI-Lab upstream <code>files/memwatch.sh</code> +
 (leak-trend + marker + alert + gate fix, pre-sync preserved as
 <code>files/memwatch.sh.pre-sync-20261025</code>); sandbox suites of
 2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11
-starttime-baseline checks).</em></p>
+starttime-baseline checks); qwen38FN deployment config
+(<code>~/qwen-autostart.sh</code>, GMU 0.78 / HOST_SLACK_GIB 2 /
+FREE_GATE 10) and the 2026-10-25 maya-S pressure drills
+(<code>~/gpu_monitor_guard.log</code>: four kills, all external
+growers).</em></p>
 </body>
 </html>

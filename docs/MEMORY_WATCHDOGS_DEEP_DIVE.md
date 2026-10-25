@@ -271,6 +271,16 @@ Upstream's header prose matches its code, and since the 2026-10-25 sync the loca
 5. **Concurrency defeats debounce** — memwatch guards it by scoping to one container and one instance; gpu_monitor needed explicit `flock` + armed-age hardening after the 05:16:28 incident.
 6. **Slow leaks are a scheduling problem, not a kill problem** — memwatch's leak-trend says "scheduled relaunch is the response"; gpu_monitor's RSS-growth attribution handles the fast case and leaves the slow one to the WARN band.
 
+### Why the qwen38FN deployment never reaches its watchdog — design-level avoidance (2026-10-25)
+
+The 2026-10-25 pressure drills against maya-S (four confirmed kills, all external `python3`/`sleep` growers, `F:` to within ~360 MiB of the floor) raise the question: why does the vLLM deployment (`vllm-fn-tp1`, Qwen3.8-Flash-Next, :8009) never hit the `NV_ERR_NO_MEMORY` hard-lock at all? Not because memwatch is better — because the *allocator itself is capped*. Three layers, none of which maya-S currently has:
+
+1. **Static, pre-allocated pool.** vLLM reserves its entire KV-cache pool at startup (`GPU_MEMORY_UTILIZATION=0.78`, budget ≈ 93.4 GiB). During serving it never allocates beyond the reservation; requests that do not fit are **queued or preempted**, never OOM'd. A static pool cannot win an "allocation growth" contest against the driver floor. (maya-S is the same shape — 86085 MiB flat all day — which is why the guard never named the engine as victim.)
+2. **The hard cgroup ceiling.** The container runs under `memory.max = budget + HOST_SLACK_GIB` (2 GiB) ≤ the deployment ceiling (pool 119.7 − OS_RESERVE 16 = 103 GiB). An over-allocation *fails inside the container* instead of exhausting the driver. On GB10, device memory **is** system RAM, so a cgroup cap on the allocator is a direct bound on driver pressure — this is the actual crash-avoider, not the watchdog.
+3. **Margin tuning + watchdog as backstop only.** GMU 0.78 instead of 0.80 deliberately adds ~2.4 GiB of host margin so serving-time MemAvailable stays above memwatch's `FREE_GATE` (10 GiB); the 2026-09-08 history shows kills firing at avail 9.4–10.2 GiB when the margin was thinner. The watchdog's job is the allocators *outside* the engine — it never has to fire for qwen's own allocations.
+
+**The same recipe applied to maya-S**: put the engine under a systemd slice with `memory.max` ≈ pool + slack so a runaway engine fails its own allocation gracefully; shrink the context/kv ceiling so `F:` rests at 8+ GiB instead of 4.2 (the GMU-margin move); make the engine refuse or queue new requests below a headroom threshold (vLLM's preemption semantics). Then the guard demotes itself to what memwatch already is for qwen: a backstop for *external* allocators, not the primary defense.
+
 ### Gaps / future work
 
 - ~~gpu_monitor: pid-reuse mis-attribution window~~ — closed by `cbef66d` (starttime-bound baseline entries).
@@ -279,7 +289,8 @@ Upstream's header prose matches its code, and since the 2026-10-25 sync the loca
 - safe-build's `device_free_mib` spawns python per probe; fine at 15 s, wasteful if ever polled faster.
 - ~~The vLLM deployment's local `memwatch.sh` is behind upstream main (leak trend, marker, alert)~~ — closed 2026-10-25: leak-trend detector, `WATCHDOG EMERGENCY STOP` marker, `scripts/alert.sh` hook and the MemFree-gate semantics adopted from upstream; tightened 3/1/15 floors kept and now documented in the header.
 - The engine itself is ~10.6 GiB RSS by design — a genuine engine leak would self-attribute and get killed; correct trade, but remember it.
+- maya-S runs uncapped — no container, no cgroup, so every process on the box can push the driver toward its floor and the guard is the *only* defense. The qwen38FN layers above (cgroup ceiling, GMU margin, queue/preempt instead of grow) are the candidate design fix; adopting any of them is future work.
 
 ---
 
-*Companion sources: maya repo commits `dd37817`, `b4c59af`, `64dd854`, `2a2447d`, `b0304ab`, `360107e`, `cbef66d`, `e1f8f4b`, `67745c3` (+ `docs/2026-10-25-guard-concurrency.md`, `NOTICE`); MiaAI-Lab upstream `files/memwatch.sh` + `scripts/alert.sh`; local `logs/memwatch-vllm-fn-tp1.log`; memwatch sync of 2026-10-25 (leak-trend + marker + alert + gate fix, pre-sync preserved as `files/memwatch.sh.pre-sync-20261025`); sandbox suites of 2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11 starttime-baseline checks).*
+*Companion sources: maya repo commits `dd37817`, `b4c59af`, `64dd854`, `2a2447d`, `b0304ab`, `360107e`, `cbef66d`, `e1f8f4b`, `67745c3` (+ `docs/2026-10-25-guard-concurrency.md`, `NOTICE`); MiaAI-Lab upstream `files/memwatch.sh` + `scripts/alert.sh`; local `logs/memwatch-vllm-fn-tp1.log`; memwatch sync of 2026-10-25 (leak-trend + marker + alert + gate fix, pre-sync preserved as `files/memwatch.sh.pre-sync-20261025`); sandbox suites of 2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11 starttime-baseline checks); qwen38FN deployment config (`~/qwen-autostart.sh`, GMU 0.78 / HOST_SLACK_GIB 2 / FREE_GATE 10) and the 2026-10-25 maya-S pressure drills (`~/gpu_monitor_guard.log`: four kills, all external growers).*
