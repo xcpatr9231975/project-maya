@@ -41,7 +41,11 @@
 #   SAFE_DEVICE_FLOOR_MIB     freeze when device-free < this (default 4096;
 #                             sits above gpu_monitor's kill floor of 3072 so
 #                             the build freezes before the guard ever kills)
-#   SAFE_DEVICE_PROBE_EVERY_S device-free probe interval (default 60)
+#   SAFE_DEVICE_PROBE_EVERY_S device-free probe interval (default 15; was 60,
+#                             but a -j4 compiler ramp can cross the guard's
+#                             3072MiB kill floor in ~40s, well inside one 60s
+#                             probe -- the drill on 2026-10-25 showed exactly
+#                             that with a 2 GB/s allocator)
 #   SAFE_FROZEN_MAX_S         max time frozen before SIGTERM (default 300)
 #   SAFE_NO_PREFLIGHT         set to 1 to skip the pre-flight check
 #
@@ -57,7 +61,7 @@ SAFE_ABORT_GIB="${SAFE_ABORT_GIB:-4}"
 SAFE_SWAP_FLOOR_GIB="${SAFE_SWAP_FLOOR_GIB:-4}"
 SAFE_PSI_FULL="${SAFE_PSI_FULL:-5.0}"
 SAFE_DEVICE_FLOOR_MIB="${SAFE_DEVICE_FLOOR_MIB:-4096}"
-SAFE_DEVICE_PROBE_EVERY_S="${SAFE_DEVICE_PROBE_EVERY_S:-60}"
+SAFE_DEVICE_PROBE_EVERY_S="${SAFE_DEVICE_PROBE_EVERY_S:-15}"
 SAFE_FROZEN_MAX_S="${SAFE_FROZEN_MAX_S:-300}"
 
 # --- parse args ---------------------------------------------------------------
