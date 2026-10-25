@@ -673,8 +673,8 @@ tells you <em>when</em> the relaunch is needed. Env knobs:
 <code>MEMWATCH_TREND_GIB</code> (4),
 <code>MEMWATCH_TREND_WARMUP_S</code> (900),
 <code>MEMWATCH_TREND_BASELINE_S</code> (600).</p>
-<h3 id="emergency-stop-marker-alert-hook-upstream-only">3.5
-Emergency-stop marker + alert hook (upstream-only)</h3>
+<h3 id="emergency-stop-marker-alert-hook">3.5 Emergency-stop marker +
+alert hook</h3>
 <p>Before stopping, <code>stop_container</code> appends
 <code>WATCHDOG EMERGENCY STOP &lt;reason&gt;</code> to the live log —
 the supervisor distinguishes an emergency stop from a clean
@@ -687,6 +687,12 @@ container log tail (3000 lines) + watchdog log →
 <code>logs/archive/&lt;container&gt;-&lt;ts&gt;-*.log</code>, then
 <code>docker stop -t 30</code> → <code>docker kill</code>, then exit 2
 with the NVRM total since start.</p>
+<p>Adopted into the local copy on 2026-10-25
+(<code>scripts/alert.sh</code> created alongside, keeping upstream’s
+silent-safe posture: <code>ALERT_WEBHOOK</code> unset in this
+deployment’s <code>.env</code>, so alerts log to
+<code>logs/alert.log</code> and exit 0 until a webhook is
+configured).</p>
 <h3 id="the-diagnostic-heartbeat">3.6 The diagnostic heartbeat</h3>
 <p>Every 5 s (and every sample within 1 GiB of either floor) it logs the
 meminfo breakdown plus the container’s own cgroup
@@ -735,25 +741,33 @@ upstream — divergence summary</h3>
 <tr>
 <td>Leak-trend detector</td>
 <td>yes</td>
-<td><strong>missing</strong></td>
+<td>yes (synced 2026-10-25)</td>
 </tr>
 <tr>
 <td>Emergency-stop marker</td>
 <td>yes</td>
-<td><strong>missing</strong></td>
+<td>yes (synced 2026-10-25)</td>
 </tr>
 <tr>
 <td><code>scripts/alert.sh</code> hook</td>
 <td>yes</td>
-<td><strong>missing</strong></td>
+<td>yes (created 2026-10-25, no-op until <code>ALERT_WEBHOOK</code> is
+set)</td>
+</tr>
+<tr>
+<td>MemFree gate condition</td>
+<td><code>avail &lt; FREE_GATE</code></td>
+<td><code>avail &lt; FREE_GATE</code> (pre-sync copy gated on
+<code>&lt; MIN_GIB</code> — found and fixed in the sync)</td>
 </tr>
 </tbody>
 </table>
-<p>Upstream’s header prose (6/2) matches its code; the local header
-still says 6/2 while its code runs 3/1 — trust the code, not the header.
-The local tightening is a deliberate response to the 2026-09-05
-evidence, but pulling the leak-trend + marker + alert additions
-upstream-side would close the gap.</p>
+<p>Upstream’s header prose matches its code, and since the 2026-10-25
+sync the local header does too (the pre-sync copy said 6/2 while its
+code ran 3/1 — trust the code, not the header; preserved as
+<code>files/memwatch.sh.pre-sync-20261025</code>). The floor tightening
+stays a deliberate response to the 2026-09-05 evidence and is now
+documented in the header itself.</p>
 <hr />
 <h2 id="cross-cutting-comparison">4. Cross-cutting comparison</h2>
 <table>
@@ -871,9 +885,12 @@ flock + age floor cover it, but a lockfile owned by a <em>stale</em>
 NFS/other-filesystem context is untested.</li>
 <li>safe-build’s <code>device_free_mib</code> spawns python per probe;
 fine at 15 s, wasteful if ever polled faster.</li>
-<li>The vLLM deployment’s local <code>memwatch.sh</code> is behind
-upstream main (leak trend, marker, alert) — worth merging upstream’s
-additions while keeping the tightened 3/1/15 floors.</li>
+<li><del>The vLLM deployment’s local <code>memwatch.sh</code> is behind
+upstream main (leak trend, marker, alert)</del> — closed 2026-10-25:
+leak-trend detector, <code>WATCHDOG EMERGENCY STOP</code> marker,
+<code>scripts/alert.sh</code> hook and the MemFree-gate semantics
+adopted from upstream; tightened 3/1/15 floors kept and now documented
+in the header.</li>
 <li>The engine itself is ~10.6 GiB RSS by design — a genuine engine leak
 would self-attribute and get killed; correct trade, but remember
 it.</li>
@@ -884,9 +901,12 @@ it.</li>
 <code>b0304ab</code>, <code>360107e</code>, <code>cbef66d</code>,
 <code>e1f8f4b</code>, <code>67745c3</code> (+
 <code>docs/2026-10-25-guard-concurrency.md</code>, <code>NOTICE</code>);
-MiaAI-Lab upstream <code>files/memwatch.sh</code>; local
-<code>logs/memwatch-vllm-fn-tp1.log</code>; sandbox suites of 2026-10-25
-(9 victim-pick + 38 concurrency + 5 cursor-discipline + 11
+MiaAI-Lab upstream <code>files/memwatch.sh</code> +
+<code>scripts/alert.sh</code>; local
+<code>logs/memwatch-vllm-fn-tp1.log</code>; memwatch sync of 2026-10-25
+(leak-trend + marker + alert + gate fix, pre-sync preserved as
+<code>files/memwatch.sh.pre-sync-20261025</code>); sandbox suites of
+2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11
 starttime-baseline checks).</em></p>
 </body>
 </html>

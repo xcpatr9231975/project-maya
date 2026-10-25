@@ -208,9 +208,11 @@ The technique the user pointed at: a permanent step-up in the **`driver`** estim
 
 So the design answer to a slow leak here is not a kill — the leak is the allocator, and the remedy is a scheduled relaunch — but the detector tells you *when* the relaunch is needed. Env knobs: `MEMWATCH_TREND_GIB` (4), `MEMWATCH_TREND_WARMUP_S` (900), `MEMWATCH_TREND_BASELINE_S` (600).
 
-### 3.5 Emergency-stop marker + alert hook (upstream-only)
+### 3.5 Emergency-stop marker + alert hook
 
 Before stopping, `stop_container` appends `WATCHDOG EMERGENCY STOP <reason>` to the live log — the supervisor distinguishes an emergency stop from a clean `stop.sh` because **only the emergency path emits it** (their review §4.1); it goes into the log *before* the final archive copy so both carry it. Then, after the stop, an optional `scripts/alert.sh "memwatch emergency stop: $1"` fires (failure must not change control flow, §4.6). Archival order: container log tail (3000 lines) + watchdog log → `logs/archive/<container>-<ts>-*.log`, then `docker stop -t 30` → `docker kill`, then exit 2 with the NVRM total since start.
+
+Adopted into the local copy on 2026-10-25 (`scripts/alert.sh` created alongside, keeping upstream's silent-safe posture: `ALERT_WEBHOOK` unset in this deployment's `.env`, so alerts log to `logs/alert.log` and exit 0 until a webhook is configured).
 
 ### 3.6 The diagnostic heartbeat
 
@@ -237,11 +239,12 @@ MemFree collapses ~100× (101 GiB → 0.9 GiB) while MemAvailable stays at ~28 G
 |---|---|---|
 | MemAvailable floor / debounce | 6 GiB / 5 consecutive | **3 GiB / 15** (tightened) |
 | MemFree floor | 2 GiB | **1 GiB** (tightened) |
-| Leak-trend detector | yes | **missing** |
-| Emergency-stop marker | yes | **missing** |
-| `scripts/alert.sh` hook | yes | **missing** |
+| Leak-trend detector | yes | yes (synced 2026-10-25) |
+| Emergency-stop marker | yes | yes (synced 2026-10-25) |
+| `scripts/alert.sh` hook | yes | yes (created 2026-10-25, no-op until `ALERT_WEBHOOK` is set) |
+| MemFree gate condition | `avail < FREE_GATE` | `avail < FREE_GATE` (pre-sync copy gated on `< MIN_GIB` — found and fixed in the sync) |
 
-Upstream's header prose (6/2) matches its code; the local header still says 6/2 while its code runs 3/1 — trust the code, not the header. The local tightening is a deliberate response to the 2026-09-05 evidence, but pulling the leak-trend + marker + alert additions upstream-side would close the gap.
+Upstream's header prose matches its code, and since the 2026-10-25 sync the local header does too (the pre-sync copy said 6/2 while its code ran 3/1 — trust the code, not the header; preserved as `files/memwatch.sh.pre-sync-20261025`). The floor tightening stays a deliberate response to the 2026-09-05 evidence and is now documented in the header itself.
 
 ---
 
@@ -274,9 +277,9 @@ Upstream's header prose (6/2) matches its code; the local header still says 6/2 
 - ~~gpu_monitor: journal-watch cursor advances before the query, so a timed-out `journalctl` (10 s) loses that window's lines permanently~~ — closed by `e1f8f4b` (cursor advances only after a good read; failed windows re-covered next sample).
 - gpu_monitor: baseline and state files carry no writer identity — the flock + age floor cover it, but a lockfile owned by a *stale* NFS/other-filesystem context is untested.
 - safe-build's `device_free_mib` spawns python per probe; fine at 15 s, wasteful if ever polled faster.
-- The vLLM deployment's local `memwatch.sh` is behind upstream main (leak trend, marker, alert) — worth merging upstream's additions while keeping the tightened 3/1/15 floors.
+- ~~The vLLM deployment's local `memwatch.sh` is behind upstream main (leak trend, marker, alert)~~ — closed 2026-10-25: leak-trend detector, `WATCHDOG EMERGENCY STOP` marker, `scripts/alert.sh` hook and the MemFree-gate semantics adopted from upstream; tightened 3/1/15 floors kept and now documented in the header.
 - The engine itself is ~10.6 GiB RSS by design — a genuine engine leak would self-attribute and get killed; correct trade, but remember it.
 
 ---
 
-*Companion sources: maya repo commits `dd37817`, `b4c59af`, `64dd854`, `2a2447d`, `b0304ab`, `360107e`, `cbef66d`, `e1f8f4b`, `67745c3` (+ `docs/2026-10-25-guard-concurrency.md`, `NOTICE`); MiaAI-Lab upstream `files/memwatch.sh`; local `logs/memwatch-vllm-fn-tp1.log`; sandbox suites of 2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11 starttime-baseline checks).*
+*Companion sources: maya repo commits `dd37817`, `b4c59af`, `64dd854`, `2a2447d`, `b0304ab`, `360107e`, `cbef66d`, `e1f8f4b`, `67745c3` (+ `docs/2026-10-25-guard-concurrency.md`, `NOTICE`); MiaAI-Lab upstream `files/memwatch.sh` + `scripts/alert.sh`; local `logs/memwatch-vllm-fn-tp1.log`; memwatch sync of 2026-10-25 (leak-trend + marker + alert + gate fix, pre-sync preserved as `files/memwatch.sh.pre-sync-20261025`); sandbox suites of 2026-10-25 (9 victim-pick + 38 concurrency + 5 cursor-discipline + 11 starttime-baseline checks).*
