@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Memory Watchdogs on the DGX Spark — Deep Dive</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+  <style>
+  body{max-width:900px;margin:2em auto;padding:0 1em;font-family:-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.55;color:#1a1a1a}
+  h1,h2,h3{border-bottom:1px solid #ddd;padding-bottom:.2em}
+  table{border-collapse:collapse;margin:1em 0;font-size:.92em}
+  th,td{border:1px solid #bbb;padding:4px 8px;text-align:left}
+  th{background:#f0f0f0}
+  pre{background:#f6f8fa;padding:.7em 1em;border-radius:6px;overflow-x:auto;font-size:.9em}
+  code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:.92em}
+  pre code{background:none;padding:0}
+  blockquote{border-left:4px solid #ccc;margin:1em 0;padding:.2em 1em;color:#555}
+  hr{border:none;border-top:2px solid #eee;margin:2em 0}
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Memory Watchdogs on the DGX Spark — Deep Dive</h1>
+</header>
+<h1 id="memory-watchdogs-on-the-dgx-spark-deep-dive">Memory Watchdogs on
+the DGX Spark — Deep Dive</h1>
+<p><em>Three independent guards, one failure mode: on GB10 unified
+memory, exhaustion hangs the kernel instead of raising OOM.</em></p>
+<p><strong>Scope</strong>: <code>tools/gpu_monitor.py</code> +
+<code>safe-build.sh</code> (project-maya, this box) and
+<code>memwatch.sh</code> from <a
+href="https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/blob/main/files/memwatch.sh">MiaAI
+Lab’s Qwen3.8-Flash-Next-Single-DGX-Spark</a> (the vLLM deployment).
+Written 2026-10-25, re-verified through commits <code>b0304ab</code>
+(concurrency hardening) and <code>360107e</code> (journal watch) and
+after reading the upstream MiaAI-Lab source.</p>
+<hr />
+<h2 id="why-all-three-exist">0. Why all three exist</h2>
+<p>The DGX Spark GB10 has <em>unified memory</em>: the CUDA device pool
+<strong>is</strong> system RAM. Two consequences drive every design
+decision below:</p>
+<ol type="1">
+<li><strong><code>MemAvailable</code> lies.</strong> A process can be ~1
+GiB from <code>NV_ERR_NO_MEMORY</code> while <code>MemAvailable</code>
+still reads a healthy ~20 GiB — the driver’s pool drains through a
+channel <code>/proc/meminfo</code> books under other names. The only
+honest probe is <code>cudaMemGetInfo</code> (device-free).</li>
+<li><strong>No OOM-killer rescue.</strong> When the pool runs out, the
+driver returns <code>NV_ERR_NO_MEMORY</code> and its error path
+deadlocks: the box hard-locks with nothing on the console, and with the
+kernel watchdog disabled (“NMI not fully supported”) only a power-cycle
+recovers it. Nobody reaps the offender for you; something must kill it
+<em>before</em> the floor is crossed.</li>
+</ol>
+<p>So the box runs defense-in-depth:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Tool</th>
+<th>Cadence</th>
+<th>Acts on</th>
+<th>Reaction</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 — build wrapper</td>
+<td><code>safe-build.sh</code></td>
+<td>every 5 s (device probe 15 s)</td>
+<td>the build’s own process group</td>
+<td>SIGSTOP (freeze) → resume / abort</td>
+</tr>
+<tr>
+<td>2 — system guard</td>
+<td><code>gpu_monitor.py</code></td>
+<td>~10 s (systemd timer + <code>Restart=always</code>)</td>
+<td>any process on the box</td>
+<td>SIGTERM → SIGKILL after 30 s grace</td>
+</tr>
+<tr>
+<td>3 — container watchdog</td>
+<td><code>memwatch.sh</code> (MiaAI Lab)</td>
+<td>every 1 s, debounced</td>
+<td>the vLLM container</td>
+<td>archive + marker + alert + <code>docker stop</code></td>
+</tr>
+</tbody>
+</table>
+<p>The layering is deliberate: <strong>safe-build’s freeze floors sit
+above the guard’s kill floors</strong> (device-free 4096 MiB vs 3072
+MiB; PSI 5.0 % on both, but safe-build polls at 5 s vs the guard’s ~10 s
+two-strike cadence), so a runaway build freezes itself before the guard
+ever has to pick a victim — and the guard’s victim pick is designed so
+that when it <em>does</em> fire, it kills the culprit, not the
+engine.</p>
+<hr />
+<h2 id="toolsgpu_monitor.py-the-system-guard">1.
+<code>tools/gpu_monitor.py</code> — the system guard</h2>
+<p><em>Current at commit <code>b0304ab</code> (fork/main +
+private/main); deployed copy byte-identical.</em></p>
+<h3 id="architecture-one-sample-per-invocation">1.1 Architecture: one
+sample per invocation</h3>
+<p>The unit is not a daemon loop; systemd re-invokes <code>main()</code>
+every ~10 s (<code>Restart=always</code> + <code>RestartSec=10</code>).
+Each invocation is one <em>sample</em>. Anything spanning samples lives
+in files:</p>
+<ul>
+<li><code>~/.gpu_monitor_guard_state</code> —
+<code>armed:&lt;ts&gt;</code> (first breach, awaiting confirmation) or
+<code>termed:&lt;pid&gt;:&lt;ts&gt;</code> (SIGTERM sent, awaiting
+exit/grace)</li>
+<li><code>~/.gpu_monitor_guard_rss</code> — the pid→RSS baseline for
+growth attribution</li>
+<li><code>~/.gpu_monitor_guard_lock</code> — the whole-run
+<code>flock</code> (below)</li>
+<li><code>~/.gpu_monitor_guard_warned</code> — warning-band throttle
+state</li>
+</ul>
+<p>This gives crash-free restart semantics at the cost of two-sample
+confirmation for every trigger.</p>
+<h3 id="trigger-order">1.2 Trigger order</h3>
+<p>Evaluated per sample, in the order they matter:</p>
+<ol type="1">
+<li><strong>device-free</strong> &lt; <code>DEVICE_FREE_FLOOR_MIB</code>
+(3072 MiB) — via <code>cudaMemGetInfo</code>; <em>the only signal that
+saw the failure coming</em> (measured: ~0.3 s and ~170 MiB of device
+memory per probe call).</li>
+<li><strong>MemAvailable</strong> &lt; <code>MEM_FLOOR_GIB</code> (6
+GiB) — OS-side exhaustion.</li>
+<li><strong>GPU compute-app total</strong> &gt;
+<code>GPU_CEIL_MIB</code> (112640 MiB) — backstop when the CUDA probe is
+unavailable.</li>
+<li><strong>PSI memory full avg10</strong> ≥ 5.0 % for two consecutive
+samples — the kernel saying allocation is already stalling.</li>
+<li><strong>swap used</strong> ≥ 8 GiB — the pre-lock thrash
+signature.</li>
+<li><strong><code>NV_ERR_NO_MEMORY</code> lines new in the kernel
+log</strong> since the previous sample (commit <code>360107e</code>) —
+the driver literally refusing an allocation. No thresholds, no CUDA
+probe; works even when <code>cudaMemGetInfo</code> is unavailable.
+Technique credited to MiaAI Lab’s <code>memwatch.sh</code> in
+<code>NOTICE</code> (AGPL-3.0-or-later; reimplemented from scratch, no
+code taken).</li>
+</ol>
+<p>Any breach arms; a second breach within <code>GUARD_CONSEC_S</code>
+(30 s) confirms and picks a victim.</p>
+<h3 id="victim-selection-the-2026-10-25-design">1.3 Victim selection —
+the 2026-10-25 design</h3>
+<pre><code>high_gpu?                     → top GPU consumer (holder of that memory, by definition)
+low_free + OS_VICTIM_BY_RSS?  → RSS-growth attribution, else top GPU consumer
+OS-side only (avail/psi/swap) → biggest-RSS process (_os_victim), else GPU pick</code></pre>
+<p><strong>RSS-growth attribution</strong> (commit <code>64dd854</code>)
+fixes the GB10 blind spot: a process holding <em>no</em> GPU memory (an
+unwrapped build) can drive device-free below the floor, and the old pick
+killed the engine for it — while the engine’s own CUDA allocations never
+show in RSS, so it could never win an RSS pick either.</p>
+<p>Mechanics:</p>
+<ul>
+<li>Every <strong>healthy</strong> sample writes a
+<code>pid→(RSS, starttime)</code> baseline
+(<code>~/.gpu_monitor_guard_rss</code>) — starttime from
+<code>/proc/&lt;pid&gt;/stat</code> field 22 binds each entry to that
+exact process, so a pid <strong>reused</strong> within the 300 s window
+counts as a fresh process (full RSS = growth) instead of inheriting the
+old tenant’s RSS, and a pid with no <code>/proc</code> stat any more is
+skipped (commit <code>cbef66d</code>); the legacy two-token format
+parses as a same-process delta until the next healthy rewrite.</li>
+<li>On a device-free breach, the victim is the process whose RSS grew
+the most since the baseline — <em>new processes count as full
+growth</em> (<code>base.get(pid, 0)</code>), so a fresh build is caught
+on its first confirming sample.</li>
+<li>Growth must exceed <code>RSS_GROW_MIN_KIB</code> (256 MiB) —
+page-noise filter.</li>
+<li>Baselines older than <code>RSS_BASE_MAX_AGE_S</code> (300 s) are
+discarded rather than mis-attributed.</li>
+<li>The baseline is <strong>not rewritten while a breach is
+active</strong> (<code>_REBASE_OK</code> gates the rebase to healthy
+samples only), so growth accumulates across the armed→confirm
+window.</li>
+</ul>
+<h3 id="kill-path">1.4 Kill path</h3>
+<pre><code>confirm → victim picked → state termed:&lt;pid&gt;:&lt;ts&gt; → SIGTERM
+next samples: alive after GUARD_GRACE_S (30 s) → SIGKILL → &quot;guard:killed&quot;
+              exited (zombie-aware via /proc/&lt;pid&gt;/stat &#39;Z&#39;) → state cleared</code></pre>
+<p><code>GPU_MONITOR_PROTECT</code> (comma list of pids or /proc names)
+always skips a victim.</p>
+<h3 id="concurrency-hardening-commit-b0304ab-the-051628-incident">1.5
+Concurrency hardening — commit <code>b0304ab</code> (the 05:16:28
+incident)</h3>
+<p>Two-sample confirmation <strong>collapsed under parallel
+invocations</strong>, seen live on 2026-10-25 05:16:28: the systemd
+service plus a manual run from an SSH session both logged
+<code>armed</code> <em>in the same second</em> — the second invocation
+read the first’s freshly-written state as its own confirming sample and
+SIGTERMed on a single dip. In that drill the victim was a test dummy (a
+<code>sleep</code> with synthetic breach values), but on a genuine
+one-sample dip an innocent process would have taken the kill. The
+defect, precisely: invocation B reads <code>armed:&lt;ts&gt;</code>
+written by A moments earlier, computes
+<code>now − ts ≈ 0 ≤ GUARD_CONSEC_S</code>, and confirms on B’s
+<em>first</em> sighting — the two-sample rule becomes a one-sample kill.
+State-file and baseline write races compound it (B’s
+<code>termed:&lt;pid&gt;</code> can overwrite A’s <code>armed</code>
+mid-decision).</p>
+<p>Two independent guards, either sufficient alone, per
+<code>docs/2026-10-25-guard-concurrency.md</code>:</p>
+<ol type="1">
+<li><strong>Whole-run exclusive <code>flock</code></strong>
+(<code>.gpu_monitor_guard_lock</code>, <code>LOCK_EX|LOCK_NB</code>,
+held across <code>memory_guard</code> <em>and</em> the baseline write):
+a concurrent invocation skips sampling and guard logic entirely (exit 0,
+logs nothing) — the holder is the live sampler for that instant. Every
+read-modify-write cycle is single-threaded by construction. The kernel
+drops the lock when the fd closes or the holder dies (even SIGKILLed),
+so no crashed run can wedge the next sample. If the lockfile cannot even
+be opened, the run proceeds <em>unlocked rather than blind</em>.</li>
+<li><strong>Armed-age floor</strong> —
+<code>GPU_MONITOR_MIN_CONFIRM_AGE_S</code> (default 8 s, ~80 % of the 10
+s cadence): a confirming sample must observe an armed state written by
+an <strong>earlier</strong> invocation; a fresher one logs
+<code>guard:pending</code> and keeps the original timestamp untouched,
+so the honest first sighting survives even without the lock (cron with a
+different cadence, or a future lock removal).</li>
+</ol>
+<p>Verified by the sandbox suite, now <strong>38 checks</strong>,
+including two threads racing <code>main()</code>: exactly one sample
+line, no kill, and a later invocation confirms normally.</p>
+<h3
+id="the-journal-watch-commit-360107e-cross-pollination-from-memwatch.sh">1.6
+The journal watch — commit <code>360107e</code> (cross-pollination from
+memwatch.sh)</h3>
+<p>memwatch.sh’s best signal — <code>NV_ERR_NO_MEMORY</code> delta
+counting — is now in the guard too, reimplemented from scratch and
+credited in <code>NOTICE</code>. The port is not a copy: the
+one-shot-process constraint demanded a different mechanism.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>memwatch.sh (daemon)</th>
+<th>gpu_monitor.py (one shot per sample)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nvrm_since</code> datetime string advanced in-process</td>
+<td>epoch cursor in <code>~/.gpu_monitor_guard_nvrm</code></td>
+</tr>
+<tr>
+<td>fixed cadence windows</td>
+<td>adjacent <code>[last, now]</code> epoch windows, one per sample</td>
+</tr>
+<tr>
+<td>counts via <code>journalctl -k --since/--until</code></td>
+<td>same query, epoch form <code>--since=@last --until=@now</code></td>
+</tr>
+</tbody>
+</table>
+<p>Design points worth keeping:</p>
+<ul>
+<li><strong>First run initialises only</strong> — writes the cursor,
+returns 0. There is no lower bound on the first window, so counting then
+could replay an <em>old</em> flood as a fresh breach; init-only avoids
+it.</li>
+<li><strong>Boundary double-count is accepted, not engineered
+away.</strong> <code>journalctl --since/--until</code> are inclusive at
+the boundary instant, so a line stamped exactly at the boundary counts
+in both adjacent windows. Documented as harmless for a trigger —
+preferred over a <code>last + ε</code> window that could silently drop a
+line arriving within the epsilon (the same lesson memwatch learned with
+its 12 s/10 s overlap).</li>
+<li><strong><code>pool_breach = low_free or nvrm_hit</code></strong> —
+an NVRM-only breach (device probe unavailable, say) routes through the
+<em>growth-attribution</em> victim pick, because on GB10 the refuser may
+hold no GPU memory. high_gpu stays a separate first branch (victim = top
+GPU consumer by definition).</li>
+<li><strong>Two-sample confirmation applies unchanged</strong>: one
+transient refusal the engine retried past recovers; persistent refusals
+confirm and kill.</li>
+<li><strong>Journal unavailable → <code>None</code> → inert</strong> (no
+false kills from a broken <code>journalctl</code>); timeout is 10
+s.</li>
+<li><strong>The cursor advances only after a good read</strong> (commit
+<code>e1f8f4b</code>): a timed-out or failed <code>journalctl</code>
+leaves it at <code>last</code>, so the next sample re-covers the whole
+<code>[last, next]</code> window — no lines lost, and a long journal
+outage counts its lines once, on the first sample that succeeds.</li>
+<li>Sample lines and reports now carry <code>N:&lt;count&gt;</code>
+every sample.</li>
+</ul>
+<p>Minor accepted cost resolved by <code>e1f8f4b</code>: the cursor now
+advances only after a successful query, so a timed-out window is
+re-covered by the next sample instead of losing its lines.</p>
+<h3
+id="verified-behavior-commits-64dd854-b0304ab-360107e-cbef66d-e1f8f4b">1.7
+Verified behavior (commits <code>64dd854</code> + <code>b0304ab</code> +
+<code>360107e</code> + <code>cbef66d</code> + <code>e1f8f4b</code>)</h3>
+<p>9 offline victim-pick tests (healthy rebase, round-trip,
+arm/no-rebase, below-min fallback, stale baseline, self-exclusion, full
+arm→confirm→SIGTERM→state-clear cycle, name-protect, empty baseline),
+the 38-check concurrency suite including two threads racing
+<code>main()</code>, the journal-watch suite (<strong>46 checks</strong>
+total, including first-run cursor init and inert-on-unavailable paths),
+a <strong>5-check cursor-discipline suite</strong> (first-run init /
+success advances / timeout holds / failure holds / clock-skew no-query),
+and an <strong>11-check starttime-baseline suite</strong>
+(same-starttime delta, reused-pid full-RSS attribution, dead-pid skip,
+unlisted-pid growth, legacy-format tolerance, below-min, real-child
+round-trip, 3-token format, end-to-end fresh-pid-after-death, self/1/2
+exclusion) — which caught a real parse bug (a legacy
+<code>pid:rss</code> token yielded <code>int("")</code> → silently empty
+baseline) before it shipped. The baseline and cursor suites now live
+in-repo and run in CI on every push:
+<code>tools/test_gpu_monitor_baseline.py</code>,
+<code>tools/test_gpu_monitor_nvrm.py</code> (commit
+<code>67745c3</code>).</p>
+<p>Residual risks: pid reuse within the 300 s baseline window could
+mis-attribute (falls back to the old GPU pick); a breach from many
+processes each growing &lt;256 MiB falls back to the engine kill.</p>
+<hr />
+<h2 id="safe-build.sh-the-build-watchdog">2. <code>safe-build.sh</code>
+— the build watchdog</h2>
+<p><em>Current at commits <code>b4c59af</code> +
+<code>2a2447d</code>.</em></p>
+<h3 id="contract">2.1 Contract</h3>
+<p>Wrap any command so it <strong>can never push the box to the guard’s
+kill floors</strong>, and never dies unwatched:</p>
+<pre><code>./safe-build.sh                      # ninja -C build -j4
+./safe-build.sh -C build-tests       # ninja -C build-tests -j4
+./safe-build.sh -j2 -C build         # ninja -C build -j2
+./safe-build.sh -- cmake --build ... # any command under the watchdog</code></pre>
+<p>Exit codes: <code>0</code> ok · <code>124</code> watchdog aborted ·
+<code>125</code> pre-flight refused · <code>126/127</code> command not
+executable/not found · else the command’s own rc.</p>
+<h3 id="the-four-stages">2.2 The four stages</h3>
+<ol start="0" type="1">
+<li><strong>Pre-flight</strong> — refuse (rc 125) when MemAvailable &lt;
+8 GiB or device-free &lt; 4096 MiB <em>before</em> starting.</li>
+<li><strong>Isolation</strong> —
+<code>setsid nice -n 10 ionice -c2 -n7</code>: the build becomes its own
+session leader (<code>pgid == pid</code>), every compiler it spawns
+joins that group → <strong>one signal stops all of it</strong>. Niced
+for CPU, ioniced for I/O so the engine’s serving latency is protected
+even before any freeze.</li>
+<li><strong>Watchdog loop</strong> (every <code>SAFE_POLL_S</code>=5 s)
+— four freeze triggers, any one suffices:
+<ul>
+<li>MemAvailable &lt; 8 GiB</li>
+<li>swap used ≥ 4 GiB</li>
+<li>PSI memory full avg10 ≥ 5.0 % for two consecutive samples
+(<code>PSI_STRIKES</code>)</li>
+<li>device-free &lt; 4096 MiB — probed every
+<code>SAFE_DEVICE_PROBE_EVERY_S</code>=15 s via the same
+<code>cudaMemGetInfo</code> trick the guard uses → breach:
+<code>kill -STOP -$PGID</code> (the whole group freezes; the box gets
+memory back since stopped build pages reclaim).</li>
+</ul></li>
+<li><strong>Escalation</strong> — frozen ≥
+<code>SAFE_FROZEN_MAX_S</code> (300 s), or while frozen MemAvailable
+sinks below the abort floor (4 GiB): SIGTERM the group, 2 s,
+SIGCONT+SIGKILL, exit 124. Recovered for a check while frozen → SIGCONT,
+resume.</li>
+</ol>
+<h3 id="signal-handling-fixed-2026-10-25-commit-b4c59af">2.3 Signal
+handling (fixed 2026-10-25, commit <code>b4c59af</code>)</h3>
+<ul>
+<li><code>INT</code> trapped → exit 130 (the old handler couldn’t stop
+the loop: the build kept running after Ctrl-C).</li>
+<li><code>TERM</code> trapped → TERM the group, 2 s, CONT+KILL, exit 124
+(an untrapped TERM left the build running unwatched).</li>
+<li><code>EXIT</code> → cleanup: CONT the group either way, so a
+finished/killed build never stays SIGSTOPped.</li>
+</ul>
+<h3 id="the-floor-ordering-invariant">2.4 The floor-ordering
+invariant</h3>
+<pre><code>safe-build device-free freeze 4096 MiB  &gt;  gpu_monitor kill 3072 MiB
+safe-build PSI strike at 5.0 %, polls 5 s  → strike in ~5–10 s
+gpu_monitor PSI kill at 5.0 %, samples ~10 s → confirm ~20 s</code></pre>
+<p>So on any build-caused breach, safe-build freezes first and the guard
+never fires. The 2026-10-25 drill proved the device probe had to be 15 s
+not 60 s (commit <code>2a2447d</code>): a -j4 compiler ramp crossed the
+guard’s 3072 MiB floor in ~40 s with a 2 GB/s allocator —
+<em>inside</em> one 60 s probe window.</p>
+<h3 id="env-knobs">2.5 Env knobs</h3>
+<p><code>SAFE_J</code> (4) · <code>SAFE_DIR</code> (repo
+<code>build/</code>) · <code>SAFE_POLL_S</code> (5) ·
+<code>SAFE_FLOOR_GIB</code> (8) · <code>SAFE_ABORT_GIB</code> (4) ·
+<code>SAFE_SWAP_FLOOR_GIB</code> (4) · <code>SAFE_PSI_FULL</code> (5.0)
+· <code>SAFE_DEVICE_FLOOR_MIB</code> (4096) ·
+<code>SAFE_DEVICE_PROBE_EVERY_S</code> (15) ·
+<code>SAFE_FROZEN_MAX_S</code> (300) · <code>SAFE_NO_PREFLIGHT</code>
+(0).</p>
+<hr />
+<h2 id="memwatch.sh-the-container-watchdog-miaai-lab">3.
+<code>memwatch.sh</code> — the container watchdog (MiaAI Lab)</h2>
+<p><em>Source of truth: <a
+href="https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/blob/main/files/memwatch.sh">upstream
+<code>files/memwatch.sh</code></a>, AGPL-3.0, MiaAI Lab. Same box,
+different deployment: it protects the host from the vLLM container by
+stopping the container. The local copy in
+<code>~/qwen38-flash-next-vllm/files/</code> runs </em>tighter* floors
+than upstream but is missing upstream’s newer features — see §3.7.*</p>
+<h3 id="philosophy-second-line-of-defence">3.1 Philosophy: second line
+of defence</h3>
+<p>Behind <code>start.sh</code>’s <code>HOST_RESERVE_GIB</code> budget —
+a userspace poller cannot catch a GiB/s collapse alone. On unified
+memory “exhausted pool” means <em>kernel hang</em>, so its remedy is to
+stop the container (<code>docker stop -t 30</code>, i.e. SIGTERM; a
+SIGKILL leaks the container’s POSIX shm onto the host’s
+<code>/dev/shm</code> until reboot because of <code>--ipc host</code>),
+falling back to <code>docker kill</code>.</p>
+<h3 id="two-independent-triggers-each-debounced">3.2 Two independent
+triggers, each debounced</h3>
+<p>Every 1 s sample; a trigger must hold for <code>CONSEC</code>
+<strong>consecutive</strong> samples — a lone excursion is logged and
+resets the counter:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>Upstream default</th>
+<th>Local copy</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MemAvailable &lt; <code>MIN_GIB</code></td>
+<td>6 GiB (arg 2)</td>
+<td><strong>3 GiB</strong></td>
+<td>page cache gone; PLE lookups about to hit NVMe</td>
+</tr>
+<tr>
+<td>MemFree &lt; <code>MEMWATCH_MIN_FREE_GIB</code>
+<strong>while</strong> MemAvailable &lt; <code>FREE_GATE_GIB</code> (10
+GiB)</td>
+<td>2 GiB</td>
+<td><strong>1 GiB</strong></td>
+<td>the driver refuses allocations (NV_ERR_NO_MEMORY) at MemFree ≈ 3 GiB
+while MemAvailable still reads 6+ — the avail floor alone reacts
+late</td>
+</tr>
+</tbody>
+</table>
+<p>The MemFree gate is the subtle part, with measured evidence in the
+header (2026-09-05 00:49, during weight loading): MemFree 0.9 GiB,
+MemAvailable 32 GiB, <strong>zero NVRM errors</strong>. With stock
+kernel watermarks MemFree legitimately falls to the ~170 MB low
+watermark whenever the page cache is full of reclaimable data — <em>free
+pages backed by reclaimable cache are not what the driver runs out of;
+free pages with no cache left to reclaim are.</em> Hence the
+AND-gate.</p>
+<h3 id="the-earliest-signal-nv_err-delta-counting">3.3 The earliest
+signal: NV_ERR delta counting</h3>
+<p>Every 10 s it counts <code>NV_ERR_NO_MEMORY</code> lines the kernel
+log gained <strong>since the previous check</strong>
+(<code>journalctl -k --since/--until</code>), logging the delta and a
+running total. Two measured lessons live in the comments:</p>
+<ul>
+<li>A fixed 12 s window every 10 s double-counted lines in the 2 s
+overlap (6 counted for 5 logged, 2026-09-05 09:00) → now advancing
+since/until windows.</li>
+<li><code>journalctl --since</code> is inclusive at second granularity →
+the boundary second is excluded on the next pass by advancing
+<code>nvrm_since</code> past each check.</li>
+</ul>
+<h3 id="leak-trend-detector-upstream-only-4.3-of-their-review">3.4
+Leak-trend detector (upstream-only, §4.3 of their review)</h3>
+<p>The technique the user pointed at: a permanent step-up in the
+<strong><code>driver</code></strong> estimator signals the CUDA caching
+allocator growing —
+<code>driver = MemTotal − MemFree − Buffers − Cached − AnonPages − Slab − PageTables − KernelStack</code>
+— memory that is neither free, page cache, anon, slab nor page tables,
+i.e. taken through the NVIDIA driver (GPU allocations, pinned host
+buffers). Upstream turns that into a <em>slow leak</em> detector:</p>
+<ul>
+<li>Baseline window: only after <code>TREND_WARMUP_S</code> (900 s ≈ 15
+min — <strong>the weight-load ramp grows <code>driver</code>
+immediately, so a min including that ramp would make every cold start
+look like a leak</strong>), over the next <code>TREND_BASELINE_S</code>
+(600 s) take the <strong>minimum</strong> <code>driver</code> seen, then
+freeze it.</li>
+<li>Flag when <code>driver − baseline ≥ TREND_GIB</code> (4 GiB),
+<strong>at most once per day</strong> (<code>trend_logged_day</code>):
+<em>“The 2–3 GiB per-request growth is accumulating; scheduled relaunch
+is the response.”</em></li>
+</ul>
+<p>So the design answer to a slow leak here is not a kill — the leak is
+the allocator, and the remedy is a scheduled relaunch — but the detector
+tells you <em>when</em> the relaunch is needed. Env knobs:
+<code>MEMWATCH_TREND_GIB</code> (4),
+<code>MEMWATCH_TREND_WARMUP_S</code> (900),
+<code>MEMWATCH_TREND_BASELINE_S</code> (600).</p>
+<h3 id="emergency-stop-marker-alert-hook-upstream-only">3.5
+Emergency-stop marker + alert hook (upstream-only)</h3>
+<p>Before stopping, <code>stop_container</code> appends
+<code>WATCHDOG EMERGENCY STOP &lt;reason&gt;</code> to the live log —
+the supervisor distinguishes an emergency stop from a clean
+<code>stop.sh</code> because <strong>only the emergency path emits
+it</strong> (their review §4.1); it goes into the log <em>before</em>
+the final archive copy so both carry it. Then, after the stop, an
+optional <code>scripts/alert.sh "memwatch emergency stop: $1"</code>
+fires (failure must not change control flow, §4.6). Archival order:
+container log tail (3000 lines) + watchdog log →
+<code>logs/archive/&lt;container&gt;-&lt;ts&gt;-*.log</code>, then
+<code>docker stop -t 30</code> → <code>docker kill</code>, then exit 2
+with the NVRM total since start.</p>
+<h3 id="the-diagnostic-heartbeat">3.6 The diagnostic heartbeat</h3>
+<p>Every 5 s (and every sample within 1 GiB of either floor) it logs the
+meminfo breakdown plus the container’s own cgroup
+<code>memory.current</code>
+(<code>/sys/fs/cgroup/system.slice/docker-&lt;id&gt;.scope/</code>).</p>
+<h3 id="the-weight-load-ramp-as-actually-logged-2026-10-21">3.7 The
+weight-load ramp, as actually logged (2026-10-21)</h3>
+<p><code>logs/memwatch-vllm-fn-tp1.log</code> shows exactly why the
+estimator exists — 45 s of container ramp:</p>
+<pre><code>05:48:41  avail=106701MiB free=101426MiB container= 5032MiB driver= 2712MiB
+05:48:46  avail= 60421MiB free= 55117MiB container= 6517MiB driver=47322MiB   ← weights land
+05:48:51  avail= 30344MiB free= 22519MiB container= 9093MiB driver=76948MiB
+05:49:17  avail= 29630MiB free=  2205MiB container=27000MiB driver=76932MiB   ← cache eats free
+05:49:27  avail= 28447MiB free=   896MiB container=31070MiB driver=76859MiB   ← MemFree at floor,
+                                                                              avail still 28 GiB</code></pre>
+<p>MemFree collapses ~100× (101 GiB → 0.9 GiB) while MemAvailable stays
+at ~28 GiB — the exact signature the MemFree gate exists for.
+<code>driver</code> steps 2.7 → 77 GiB permanently: the CUDA caching
+allocator, never returned.</p>
+<h3 id="local-copy-vs-upstream-divergence-summary">3.8 Local copy vs
+upstream — divergence summary</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th></th>
+<th>Upstream main</th>
+<th>Local <code>~/qwen38-flash-next-vllm/files/</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MemAvailable floor / debounce</td>
+<td>6 GiB / 5 consecutive</td>
+<td><strong>3 GiB / 15</strong> (tightened)</td>
+</tr>
+<tr>
+<td>MemFree floor</td>
+<td>2 GiB</td>
+<td><strong>1 GiB</strong> (tightened)</td>
+</tr>
+<tr>
+<td>Leak-trend detector</td>
+<td>yes</td>
+<td><strong>missing</strong></td>
+</tr>
+<tr>
+<td>Emergency-stop marker</td>
+<td>yes</td>
+<td><strong>missing</strong></td>
+</tr>
+<tr>
+<td><code>scripts/alert.sh</code> hook</td>
+<td>yes</td>
+<td><strong>missing</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Upstream’s header prose (6/2) matches its code; the local header
+still says 6/2 while its code runs 3/1 — trust the code, not the header.
+The local tightening is a deliberate response to the 2026-09-05
+evidence, but pulling the leak-trend + marker + alert additions
+upstream-side would close the gap.</p>
+<hr />
+<h2 id="cross-cutting-comparison">4. Cross-cutting comparison</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>gpu_monitor.py</th>
+<th>safe-build.sh</th>
+<th>memwatch.sh</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scope</td>
+<td>whole box</td>
+<td>one wrapped command</td>
+<td>one container</td>
+</tr>
+<tr>
+<td>Poll</td>
+<td>~10 s / sample</td>
+<td>5 s (device 15 s)</td>
+<td>1 s</td>
+</tr>
+<tr>
+<td>Debounce</td>
+<td>armed → confirm, ≥8 s apart, ≤30 s</td>
+<td>PSI ×2; others immediate</td>
+<td>5–15 consecutive</td>
+</tr>
+<tr>
+<td>Honest mem probe</td>
+<td><code>cudaMemGetInfo</code> + kernel-log NVRM watch</td>
+<td><code>cudaMemGetInfo</code> (borrowed)</td>
+<td>none (meminfo + journal)</td>
+</tr>
+<tr>
+<td>Victim</td>
+<td>RSS-growth → GPU pick → RSS pick</td>
+<td>its own process group</td>
+<td>the container</td>
+</tr>
+<tr>
+<td>Kill</td>
+<td>TERM → 30 s → KILL</td>
+<td>STOP → resume/TERM/KILL</td>
+<td>docker stop -t 30 → kill</td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>whole-run flock + armed-age floor</td>
+<td>single instance by design</td>
+<td>single instance</td>
+</tr>
+<tr>
+<td>State</td>
+<td>files (state, RSS, lock, warn)</td>
+<td>in-process vars</td>
+<td>in-process counters</td>
+</tr>
+<tr>
+<td>Failure posture</td>
+<td>survives restarts (systemd)</td>
+<td>traps INT/TERM/EXIT</td>
+<td>archives + marker + alert before acting</td>
+</tr>
+</tbody>
+</table>
+<h3 id="shared-lessons-independent-rediscoveries">Shared lessons,
+independent rediscoveries</h3>
+<ol type="1">
+<li><strong><code>cudaMemGetInfo</code> is the only honest
+<em>numeric</em> floor on GB10</strong> — gpu_monitor and safe-build
+probe it; memwatch compensates with the MemFree-gate + cgroup current
+because a docker container gets neither. The <strong>journal
+watch</strong> (<code>NV_ERR_NO_MEMORY</code> delta counting) is the
+honest <em>evidential</em> signal, needs no thresholds and survives a
+dead CUDA probe — discovered by memwatch, now ported into gpu_monitor
+(<code>360107e</code>, credited in <code>NOTICE</code>,
+AGPL-3.0-or-later).</li>
+<li><strong>Two-sample / debounced confirmation everywhere</strong> —
+memwatch: 5–15 consecutive; gpu_monitor: armed→confirm, now hardened to
+≥8 s apart across invocations; safe-build: PSI ×2.</li>
+<li><strong>Kill the culprit, not the biggest name</strong> — RSS-growth
+attribution (gpu_monitor), own-group freezing (safe-build), container
+scoping (memwatch).</li>
+<li><strong>Grace before SIGKILL</strong> — 30 s everywhere; SIGKILL
+leaves residue (leaked shm for memwatch, lost ninja state for
+safe-build).</li>
+<li><strong>Concurrency defeats debounce</strong> — memwatch guards it
+by scoping to one container and one instance; gpu_monitor needed
+explicit <code>flock</code> + armed-age hardening after the 05:16:28
+incident.</li>
+<li><strong>Slow leaks are a scheduling problem, not a kill
+problem</strong> — memwatch’s leak-trend says “scheduled relaunch is the
+response”; gpu_monitor’s RSS-growth attribution handles the fast case
+and leaves the slow one to the WARN band.</li>
+</ol>
+<h3 id="gaps-future-work">Gaps / future work</h3>
+<ul>
+<li><del>gpu_monitor: pid-reuse mis-attribution window</del> — closed by
+<code>cbef66d</code> (starttime-bound baseline entries).</li>
+<li><del>gpu_monitor: journal-watch cursor advances before the query, so
+a timed-out <code>journalctl</code> (10 s) loses that window’s lines
+permanently</del> — closed by <code>e1f8f4b</code> (cursor advances only
+after a good read; failed windows re-covered next sample).</li>
+<li>gpu_monitor: baseline and state files carry no writer identity — the
+flock + age floor cover it, but a lockfile owned by a <em>stale</em>
+NFS/other-filesystem context is untested.</li>
+<li>safe-build’s <code>device_free_mib</code> spawns python per probe;
+fine at 15 s, wasteful if ever polled faster.</li>
+<li>The vLLM deployment’s local <code>memwatch.sh</code> is behind
+upstream main (leak trend, marker, alert) — worth merging upstream’s
+additions while keeping the tightened 3/1/15 floors.</li>
+<li>The engine itself is ~10.6 GiB RSS by design — a genuine engine leak
+would self-attribute and get killed; correct trade, but remember
+it.</li>
+</ul>
+<hr />
+<p><em>Companion sources: maya repo commits <code>dd37817</code>,
+<code>b4c59af</code>, <code>64dd854</code>, <code>2a2447d</code>,
+<code>b0304ab</code>, <code>360107e</code>, <code>cbef66d</code>,
+<code>e1f8f4b</code>, <code>67745c3</code> (+
+<code>docs/2026-10-25-guard-concurrency.md</code>, <code>NOTICE</code>);
+MiaAI-Lab upstream <code>files/memwatch.sh</code>; local
+<code>logs/memwatch-vllm-fn-tp1.log</code>; sandbox suites of 2026-10-25
+(9 victim-pick + 38 concurrency + 5 cursor-discipline + 11
+starttime-baseline checks).</em></p>
+</body>
+</html>
