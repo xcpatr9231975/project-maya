@@ -4,7 +4,8 @@
 > token-size benchmark and the Hugging Face publishing pipeline. Everything else is upstream's, unchanged.
 > [docs/DGX_SPARK.md](docs/DGX_SPARK.md) is the bring-up, [docs/DGX_SPARK_BUILD.md](docs/DGX_SPARK_BUILD.md)
 > says what the port changed and where every part comes from, and [BENCHMARK.md](BENCHMARK.md) has the numbers.
-> Install it the same way: `./setup.sh`.
+> Install it the same way: `./setup.sh`. [NOTICE](NOTICE) states the copyright, the licence and the provenance of
+> every part.
 
 <h1 align="center">Project Maya</h1>
 

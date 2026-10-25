@@ -1,0 +1,51 @@
+NOTICE
+
+Project Maya
+Copyright (c) 2026 Peasant Smith and the Project Maya contributors
+MIT License - the full text is in LICENSE, which this fork does not modify.
+
+This repository is a fork of https://github.com/mw00/project-maya. That is the
+canonical project: its releases, its issue tracker and its maintainers are
+there. Nothing here changes the project's ownership, its name or its licence,
+and every upstream commit, release tag and credit is preserved in this
+repository's history.
+
+WHAT THIS BRANCH ADDS
+
+The `dgx-spark` branch (the default branch of this fork) carries, on top of
+upstream v1.1.26:
+
+    Copyright (c) 2026 carlos patriawan
+    Also under the MIT License.
+
+    - the aarch64 port: NVIDIA DGX Spark (GB10) and Grace on CUDA
+      (src/kernels/cpu/portable.cpp, include/strata/platform/cpu_relax.hpp,
+      the unified-memory expert pool and the ARM spin and store fence in
+      src/core/, and the ARM handling in setup.py, maya.py and CMakeLists.txt)
+    - the prompt path's allocation-failure recovery
+      (include/strata/prefill/failure.hpp, src/prefill/, src/core/glm_prefill.cu,
+      src/program/generate.cpp)
+    - the token-size benchmark (tools/bench_tokens.py, BENCHMARK.md)
+    - the Hugging Face publishing pipeline (docs/hf-dataset/,
+      docs/hf-maya-s-v2-dgx-spark-README.md)
+
+Everything else in this branch is upstream's, unchanged. The full account of
+what the port changed, where each component comes from and what other people
+contributed is in docs/DGX_SPARK_BUILD.md.
+
+UPSTREAM'S LATER RELEASES
+
+This branch is based on v1.1.26. Upstream's releases after it (v1.1.27 at the
+time of writing) are not merged here; they are in the canonical repository and
+on this fork's `main` branch. Merging them into `dgx-spark` is a deliberate,
+tested step, not something done silently.
+
+THIRD-PARTY COMPONENTS
+
+Their authors and licences are listed in the README's "Credits and license"
+section: Strata (the engine's origin), ggml / llama.cpp (the quantization
+formats, the CPU dot products and the MMQ kernels), exllamav3 (the EXL3
+format and its CPU expert kernel), beellama.cpp (the DFlash2 drafter's
+forward), the GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017 weights by zai-org
+and DeepSeek, and the community quants and speed reports. Their notices are
+in third_party/*/LICENSE and are unmodified.
