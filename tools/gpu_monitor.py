@@ -95,6 +95,20 @@ GUARD_GRACE_S         = float(os.environ.get("GPU_MONITOR_GUARD_GRACE_S", "30"))
 PSI_FULL_FLOOR        = float(os.environ.get("GPU_MONITOR_PSI_FULL_FLOOR", "5.0"))
 SWAP_FLOOR_GIB        = float(os.environ.get("GPU_MONITOR_SWAP_FLOOR_GIB", "8"))
 OS_VICTIM_BY_RSS      = os.environ.get("GPU_MONITOR_OS_VICTIM", "1") not in ("0", "no", "false")
+
+# 2026-10-25: RSS-growth attribution for device-free breaches.  On GB10 the
+# device pool IS system RAM, so a process that holds no GPU memory at all --
+# an unwrapped build, say -- can drive device_free below the floor and the
+# old victim pick (top GPU consumer) would kill the engine for it.  Every
+# healthy sample writes a pid->RSS baseline; on a device-free breach the
+# victim is the process whose RSS grew the most since the previous sample,
+# and only when nothing grew does the old top-GPU-consumer pick apply (the
+# engine's own CUDA allocations never show in RSS).  RSS_GROW_MIN_KIB keeps
+# page-noise from framing a bystander; RSS_BASE_MAX_AGE_S discards a stale
+# baseline (monitor was down) rather than mis-attribute.
+RSS_BASE_PATH         = os.path.join(HOME, ".gpu_monitor_guard_rss")
+RSS_BASE_MAX_AGE_S    = float(os.environ.get("GPU_MONITOR_RSS_BASE_MAX_AGE_S", "300"))
+RSS_GROW_MIN_KIB      = float(os.environ.get("GPU_MONITOR_RSS_GROW_MIN_KIB", "262144"))
 _PROTECT_TOKENS       = {t.strip() for t in
                          os.environ.get("GPU_MONITOR_PROTECT", "").replace(",", " ").split()
                          if t.strip()}
@@ -365,6 +379,100 @@ def _signal_pid(pid, sig):
         return False
 
 
+_LAST_RSS = None      # {pid: rss_kib} of this sample, written by memory_guard
+_REBASE_OK = False    # True only on a fully healthy sample -> main() rebases
+
+
+def _rss_map():
+    """{pid: rss_kib} for every process with resident pages.
+
+    Kernel threads report no VmRSS and are absent.  One /proc/*/status read
+    each, a few ms for a few hundred processes -- negligible next to the
+    nvidia-smi call in the same sample.
+    """
+    d = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return d
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            with open(f"/proc/{e}/status") as f:
+                txt = f.read()
+        except OSError:
+            continue
+        m = re.search(r"^VmRSS:\s+(\d+) kB", txt, re.M)
+        if m:
+            rss = int(m.group(1))
+            if rss > 0:
+                d[int(e)] = rss
+    return d
+
+
+def _load_rss_base():
+    """(timestamp, {pid: rss_kib}) of the last baseline, or (0, {})."""
+    try:
+        with open(RSS_BASE_PATH) as f:
+            parts = f.read().split()
+        ts = float(parts[0])
+        base = {}
+        for tok in parts[1:]:
+            pid, _, rss = tok.partition(":")
+            base[int(pid)] = int(rss)
+        return ts, base
+    except (OSError, ValueError, IndexError):
+        return 0.0, {}
+
+
+def _write_rss_base(cur):
+    if not cur:
+        return
+    try:
+        with open(RSS_BASE_PATH, "w") as f:
+            f.write(f"{time.time()} "
+                    + " ".join(f"{p}:{r}" for p, r in cur.items()) + "\n")
+    except OSError:
+        pass
+
+
+def _rss_grow_victim(cur, self_pid):
+    """(pid, name, growth_kib) of the process whose RSS grew the most since
+    the previous sample, or None.
+
+    Only called on a device-free breach: the baseline is deliberately NOT
+    rewritten while a breach is active (main() rebases on healthy samples
+    only), so growth keeps accumulating against the pre-breach snapshot and
+    a slow leak is caught on the confirming sample too.  Requires a fresh
+    baseline and growth above RSS_GROW_MIN_KIB; honours the protect list.
+    """
+    ts, base = _load_rss_base()
+    if not base or time.time() - ts > RSS_BASE_MAX_AGE_S:
+        return None
+    best_pid, best_kib = None, 0
+    for pid, rss in cur.items():
+        if pid in (self_pid, 1, 2):
+            continue
+        grow = rss - base.get(pid, 0)
+        if grow > best_kib:
+            best_pid, best_kib = pid, grow
+    if best_pid is None or best_kib < RSS_GROW_MIN_KIB:
+        return None
+    nm = ""
+    try:
+        with open(f"/proc/{best_pid}/status") as f:
+            txt = f.read()
+        mm = re.search(r"^Name:\s+(.+)", txt, re.M)
+        if mm:
+            nm = mm.group(1).strip()
+    except OSError:
+        return None            # died between the scan and the pick
+    if f"{best_pid}" in _PROTECT_TOKENS or nm in _PROTECT_TOKENS:
+        return None
+    return best_pid, nm, best_kib
+
+
 def memory_guard(mem, dfree, procs, psi_f=None):
     """Kill the offending process before unified-memory exhaustion hard-locks
     the box.  Returns a short tag for the sample line, or None.
@@ -393,6 +501,10 @@ def memory_guard(mem, dfree, procs, psi_f=None):
     if not GUARD_ENABLED:
         return None
 
+    global _LAST_RSS, _REBASE_OK
+    _REBASE_OK = False
+    cur_rss = _rss_map()
+    _LAST_RSS = cur_rss
     now    = time.time()
     avail  = mem.get("MemAvailable")
     availg = avail / 1048576 if avail is not None else None
@@ -426,6 +538,7 @@ def memory_guard(mem, dfree, procs, psi_f=None):
     high_swap = swap_used is not None and swap_used >= SWAP_FLOOR_GIB
 
     if not (low_free or low_avail or high_gpu or low_psi or high_swap):
+        _REBASE_OK = True
         if state[0] == "armed":
             _set_state("")
             guard_log(f"recovered: device_free={dfree}MiB "
@@ -447,17 +560,38 @@ def memory_guard(mem, dfree, procs, psi_f=None):
         return None
 
     if state[0] == "armed" and (now - float(state[1])) <= GUARD_CONSEC_S:
-        gpu_breach = low_free or high_gpu
         victim = None
-        if gpu_breach or not OS_VICTIM_BY_RSS:
-            # 2026-10-24 fix: the old condition also matched `not procs`,
-            # which routed an OS-side breach with NO GPU compute processes
-            # (runaway build, exactly the RSS-victim use case) into this
-            # branch, picked no victim and cleared the state -- the guard
-            # armed every sample and never acted.
+        if high_gpu:
+            # GPU compute-app ceiling: whoever holds that memory is the
+            # culprit by definition.
             if procs:
                 victim = max(procs, key=lambda p: p[1])          # (pid, MiB, name)
-        else:
+        elif low_free and OS_VICTIM_BY_RSS:
+            # 2026-10-25: device memory IS RAM on GB10, so a device-free
+            # breach can be caused by a plain RSS hog that holds no GPU
+            # memory at all (an unwrapped build, say) -- killing the engine
+            # for it is exactly the failure this guard exists to prevent.
+            # Kill whoever actually grew since the previous sample.  The
+            # engine's CUDA allocations never show in RSS, so genuine
+            # engine growth falls through to the old GPU-consumer pick.
+            v = _rss_grow_victim(cur_rss, os.getpid())
+            if v is not None:
+                vk, vn, vgrow = v
+                victim = (str(vk), vgrow / 1024.0, vn or "?")
+                guard_log(f"victim by RSS growth: {vn}(pid {vk}, "
+                          f"+{vgrow / 1048576:.1f}GiB since last sample)")
+            elif procs:
+                victim = max(procs, key=lambda p: p[1])
+        elif low_free:
+            # growth attribution disabled -> old behaviour
+            if procs:
+                victim = max(procs, key=lambda p: p[1])
+        elif OS_VICTIM_BY_RSS:
+            # OS-side-only breach (mem_available / PSI / swap): the offender
+            # often holds no GPU memory -- pick the biggest-RSS process.
+            # (2026-10-24 fix: the old condition also matched `not procs`,
+            # which routed exactly this case into the GPU-consumer pick,
+            # found no victim and cleared the state -- armed forever.)
             v = _os_victim(os.getpid())
             if v is not None:
                 vk, vn, vrss = v
@@ -510,6 +644,11 @@ def main():
     psi_s, psi_f = psi_memory()
     dfree, dtotal = device_free()
     guard     = memory_guard(mem, dfree, procs, psi_f)
+    # Rebase the RSS baseline only on a healthy sample: mid-breach the
+    # pre-breach snapshot is what makes growth attribution work on the
+    # confirming sample, so it must survive.
+    if _REBASE_OK and _LAST_RSS:
+        _write_rss_base(_LAST_RSS)
     ts        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
 
