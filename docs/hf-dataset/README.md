@@ -69,7 +69,7 @@ independent engines on the same weights and the same machine:
 | Decode, 256-token answer, short context | 22.9 tok/s | 17.5-17.8 tok/s (**1.29x**) |
 | Decode, 256-token answer, 2K context | 22.9 tok/s | 15.7 tok/s (**1.46x**) |
 | Decode, 256-token answer, 8K context | 21.1 tok/s | 15.6 tok/s (**1.35x**) |
-| `--bench` (three 256-token answers) | **21.1 tok/s** | - |
+| `--bench` (three 256-token answers) | **21.2 tok/s** | - |
 
 **Without the drafter** (the same sweeps, before `--draft dflash2`):
 

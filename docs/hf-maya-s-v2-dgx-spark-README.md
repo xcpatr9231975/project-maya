@@ -48,7 +48,7 @@ project's own setup (`maya.py`).
 
 | | |
 | --- | --- |
-| Decode (256-token answers) | **21.1 tokens/s** (with the DFlash2 drafter; 16.8 without it) |
+| Decode (256-token answers) | **21.2 tokens/s** (with the DFlash2 drafter; 16.8 without it) |
 | Prefill (8K-token prompt) | **732 tokens/s** |
 | Prompt read at 16K tokens | 769 tokens/s |
 | Expert cache hit | 99.97% |
