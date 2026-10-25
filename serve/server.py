@@ -34,6 +34,7 @@ import os
 import queue
 import re
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -51,8 +52,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, images_of,
-                            literal_tags, mark_literals, openai_to_messages, unmark_literals)
+                            deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, literal_tags,
+                            mark_literals, media_of, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -1179,8 +1180,9 @@ class StrataEngine:
 
 class Vision:
     """The resident image encoder: `maya-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once.
+    and `VID <video> <out>` lines and writes each picture's embeddings (a video: one record per frame); results
+    are cached by the source's hash, so a conversation that sends the same picture again (every turn, with most
+    clients) encodes it once.
 
     On demand (start=False, `lend`/`reclaim` set - the GLM engine's VLEND / VRECLAIM): no process until a picture
     needs encoding; the engine first empties the tail of its expert cache on the first GPU and frees it, the encoder
@@ -1325,6 +1327,78 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
+            if len(self.cache) > 64:                                   # oldest first
+                old = next(iter(self.cache))
+                self.cache.pop(old)[0].unlink(missing_ok=True)
+            return self.cache[key]
+
+    VIDEO_FPS = 4.0                                        # (llama.cpp's mtmd default: the frames a second it reads)
+
+    @staticmethod
+    def video_container(data: bytes) -> str | None:
+        """The container a video's first bytes name - MP4 / MOV, WebM / MKV or AVI - else None.  Only those reach
+        ffmpeg: anything else (a playlist is text) could make it open other files or URLs while it reads."""
+        if data[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip"):
+            return "mp4"
+        if data[:4] == b"\x1a\x45\xdf\xa3":
+            return "webm"
+        if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+            return "avi"
+        return None
+
+    @staticmethod
+    def video_seconds(path: Path) -> float | None:
+        """A video file's duration by ffprobe (files only - no other protocol), None when it does not say."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries",
+                                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                               capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip().splitlines()[0]) if r.returncode == 0 and r.stdout.strip() else None
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            return None
+
+    def encode_video(self, source: str) -> tuple[Path, list[int]]:
+        """-> (embeddings file, the frames' token counts), one SVE1 record per frame."""
+        import shutil
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            raise ValueError("videos need ffmpeg and ffprobe on this PC (Linux: sudo apt install ffmpeg; Windows: winget "
+                             "install Gyan.FFmpeg; macOS: brew install ffmpeg), then restart Maya")
+        data = self.load(source)
+        if self.video_container(data) is None:
+            raise ValueError("this video's format is not one Maya reads: send MP4, MOV, WebM, MKV or AVI")
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            if key in self.cache:
+                return self.cache[key]
+            vid, out = self.dir / f"{key}.vid", self.dir / f"{key}.sve"
+            vid.write_bytes(data)
+            # a long video is many frames (every one an image's tokens): refused before it is decoded
+            limit = max(1, int(os.environ.get("STRATA_VIDEO_MAX_FRAMES", "240") or 240))
+            seconds = self.video_seconds(vid)
+            if seconds is not None and seconds * self.VIDEO_FPS > limit:
+                vid.unlink(missing_ok=True)
+                raise ValueError(f"the video is {seconds:.0f} s long: {seconds * self.VIDEO_FPS:.0f} frames at "
+                                 f"{self.VIDEO_FPS:g} a second, more than the {limit} Maya reads (MAYA_VIDEO_MAX_FRAMES "
+                                 f"sets it; every frame takes an image's share of the context)")
+            if self.proc is None:
+                self._start()
+            self.proc.stdin.write(f"VID {vid} {out}\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline().strip()
+            vid.unlink(missing_ok=True)
+            if not line.startswith("OK"):
+                raise ValueError("the video could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                     "the vision encoder stopped"))
+            # the frames' token counts come from the record headers: int32 {magic, n_tokens, nx, ny, n_embd} each
+            counts = []
+            with open(out, "rb") as f:
+                while hdr := f.read(20):
+                    magic, n, _, _, n_embd = struct.unpack("<5i", hdr)
+                    if magic != 0x31455653 or n_embd <= 0:
+                        raise ValueError("not an SVE1 embeddings file")
+                    counts.append(n)
+                    f.seek(n * n_embd * 4, 1)
+            self.cache[key] = (out, counts)
             if len(self.cache) > 64:                                   # oldest first
                 old = next(iter(self.cache))
                 self.cache.pop(old)[0].unlink(missing_ok=True)
@@ -2157,7 +2231,9 @@ class Service:
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
-        images = deepseek_images(messages) if getattr(self.template, "deepseek", False) else images_of(messages)
+        media = media_of(messages)
+        images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+                  else [src for kind, src in media if kind == "image"])
         if images and isinstance(self.vision, ds4_vision.Vision):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
@@ -2171,16 +2247,23 @@ class Service:
             ids, starts = self.vision.expand(ids, pics)
             self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
                                                      starts)
-        elif images:
+        elif media:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
-                                 "'vision'), so it cannot read images")
-            # the template's image markers: GLM-5.3 writes <|begin_of_image|><|image|><|end_of_image|>, Qwen
-            # <|vision_start|><|image_pad|><|vision_end|>
+                                 "'vision'), so it cannot read images or videos")
+            # the template's media markers: GLM-5.3 writes <|begin_of_image|><|image|><|end_of_image|> and
+            # <|begin_of_video|><|video|><|end_of_video|>, Qwen <|vision_start|><|image_pad|><|vision_end|> and
+            # <|vision_start|><|video_pad|><|vision_end|>
             glm = "<|begin_of_image|>" in self.template.source
             image_pad, image_start = ("<|image|>", "<|begin_of_image|>") if glm else (IMAGE_PAD, VISION_START)
+            video_pad, video_start = ("<|video|>", "<|begin_of_video|>") if glm else ("<|video_pad|>", VISION_START)
             pad = self.tok.encode(image_pad, parse_special=True)[0]
             start = self.tok.encode(image_start, parse_special=True)[0]
+            vp = self.tok.encode(video_pad, parse_special=True)[0]
+            vstart = self.tok.encode(video_start, parse_special=True)[0]
+            # every frame is an independent image: the image's own begin / end markers around its pads
+            iend = self.tok.encode("<|end_of_image|>" if glm else "<|vision_end|>", parse_special=True)[0]
+            frame = (start, pad, iend)
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -2190,17 +2273,19 @@ class Service:
                     raise ValueError("image preparation was cancelled")
                 self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
                 with self.vision.active():
-                    encoded = []
-                    for src in images:
+                    enc = []
+                    for kind, src in media:
                         if cancel is not None and cancel.is_set():
                             raise ValueError("image preparation was cancelled")
-                        encoded.append(self.vision.encode(src))
+                        enc.append((kind, self.vision.encode(src) if kind == "image"
+                                    else self.vision.encode_video(src)))
                 if cancel is not None and cancel.is_set():
                     raise ValueError("image preparation was cancelled")
+            literal = self.tok.encode(image_pad, parse_special=False)
+            encoded = [e for kind, e in enc if kind == "image"]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
@@ -2213,9 +2298,27 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
+            # each <|video|> marker -> its frames, every frame an independent image wrapped in the image's own
+            # markers (GLM-5.3 reads a video as a row of pictures; no timestamp text between the frames)
+            videos = [e for kind, e in enc if kind == "video"]
+            if videos:
+                vliteral = self.tok.encode(video_pad, parse_special=False)
+                out, k = [], 0
+                for j, t in enumerate(ids):
+                    if t == vp and j > 0 and ids[j - 1] == vstart and k < len(videos):
+                        for n in videos[k][1]:
+                            out += [frame[0]] + [pad] * n + [frame[2]]
+                        k += 1
+                    elif t == vp:
+                        out += vliteral
+                    else:
+                        out.append(t)
+                if k != len(videos):
+                    raise ValueError("the prompt and its videos do not match")
+                ids = out
             combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
             with open(combined, "wb") as f:
-                for path, _ in encoded:
+                for _, (path, _) in enc:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
@@ -2233,8 +2336,8 @@ class Service:
 
     def count_tokens(self, req: dict) -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
-        tools and tokenizer as prepare(), with nothing run (no image encoder: a picture counts as its marker, so the
-        count is approximate then).  The web app's context meter."""
+        tools and tokenizer as prepare(), with nothing run (no image encoder: a picture or a video counts as its
+        marker, so the count is approximate then).  The web app's context meter."""
         messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
@@ -2243,16 +2346,20 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}
-        sources = deepseek_images(messages) if getattr(self.template, "deepseek", False) else images_of(messages)
-        n, approximate = len(self.render_ids(messages, tools, kw)), len(sources) > 0
-        if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
-            try:
-                n += sum(self.vision.picture(src).tokens - 1 for src in sources)
-                approximate = False
-            except (ValueError, OSError):
-                pass
-        return {"tokens": n, "images": len(sources), "approximate": approximate,
-                "max_context": self.engine.max_context}
+        if getattr(self.template, "deepseek", False):
+            sources = deepseek_images(messages)
+            n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
+            if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
+                try:
+                    n += sum(self.vision.picture(src).tokens - 1 for src in sources)
+                    approximate = False
+                except (ValueError, OSError):
+                    pass
+            return {"tokens": n, "images": len(sources), "approximate": approximate,
+                    "max_context": self.engine.max_context}
+        media = media_of(messages)
+        return {"tokens": len(self.render_ids(messages, tools, kw)), "images": len(media),
+                "approximate": bool(media), "max_context": self.engine.max_context}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -3515,7 +3622,10 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model",
                              "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                             # (videos: the llama.cpp encoder's - GLM's; DeepSeek's encoder reads pictures only)
+                             "architecture": {"input_modalities": ["text"] if svc.vision is None else
+                                              ["text", "image", "video"] if isinstance(svc.vision, Vision) else
+                                              ["text", "image"],
                                               "output_modalities": ["text"]}}
                     self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else []})
             elif path == "/props":
@@ -4194,11 +4304,27 @@ def watch_parent(stop, stdin=None, getppid=None, poll: float = 1.0) -> None:
     ended and init or a subreaper took the server).  Both watch from threads of their own."""
     src = stdin if stdin is not None else getattr(sys.stdin, "buffer", None)
 
+    def closed_polling():
+        # Windows: the CRT keeps a descriptor's lock for a whole blocking read(), and the first `import numpy` (a
+        # picture, in a request's thread) waits on stdin's: the server froze (#444).  Polling the pipe holds no lock.
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = wintypes.HANDLE(msvcrt.get_osfhandle(src.fileno()))
+        avail = wintypes.DWORD()
+        while k32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+            if avail.value:
+                src.read1(avail.value)
+            time.sleep(0.25)
+        return ctypes.get_last_error() == 109      # ERROR_BROKEN_PIPE: the parent's end is closed
+
     def eof():
         try:
-            while src.read(1 << 12):
-                pass
-        except (OSError, ValueError):
+            if not (os.name == "nt" and stdin is None and closed_polling()):
+                while src.read(1 << 12):
+                    pass
+        except (OSError, ValueError, AttributeError):
             pass
         stop("the program that started it ended")
     if src is not None:
