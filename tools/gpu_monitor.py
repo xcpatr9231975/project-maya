@@ -28,6 +28,7 @@ never stays inactive that long.
 """
 
 import ctypes
+import fcntl
 import glob
 import os
 import re
@@ -82,6 +83,17 @@ WARN_FLOOR_GIB        = float(os.environ.get("GPU_MONITOR_WARN_FLOOR_GIB", "12")
 WARN_EVERY_S          = float(os.environ.get("GPU_MONITOR_WARN_EVERY_S", "300"))
 GUARD_CONSEC_S        = float(os.environ.get("GPU_MONITOR_GUARD_CONSEC_S", "30"))
 GUARD_GRACE_S         = float(os.environ.get("GPU_MONITOR_GUARD_GRACE_S", "30"))
+
+# 2026-10-25: two guards against concurrent invocations (see
+# docs/2026-10-25-guard-concurrency.md).  A second invocation running at the
+# same time as the first used to read the first's freshly-written armed state
+# as its own confirming sample, collapsing the two-sample rule into a
+# one-sample kill.  (1) A whole-run exclusive flock: a concurrent invocation
+# skips sampling and guard logic entirely.  (2) An armed-age floor: a
+# confirming sample must observe an armed state at least this old, i.e.
+# written by an EARLIER invocation, never a simultaneous one.
+MIN_CONFIRM_AGE_S     = float(os.environ.get("GPU_MONITOR_MIN_CONFIRM_AGE_S", "8"))
+LOCK_PATH             = os.path.join(HOME, ".gpu_monitor_guard_lock")
 
 # 2026-10-24 additions: two more breach signals and smarter victim choice.
 # PSI memory "full" avg10 is the kernel saying allocation is already
@@ -473,6 +485,45 @@ def _rss_grow_victim(cur, self_pid):
     return best_pid, nm, best_kib
 
 
+_LOCK_FD = None
+
+
+def _try_lock():
+    """True if this invocation holds the whole-run guard lock.
+
+    The lock makes every state-file and baseline read-modify-write
+    single-threaded across invocations.  flock is released by the kernel
+    when the fd is closed or the holder dies, so a SIGKILLed run can never
+    wedge the next sample.
+    """
+    global _LOCK_FD
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return True          # cannot lock -> run unlocked rather than blind
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return False
+    _LOCK_FD = fd
+    return True
+
+
+def _unlock():
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        try:
+            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            os.close(_LOCK_FD)
+        except OSError:
+            pass
+        _LOCK_FD = None
+
+
 def memory_guard(mem, dfree, procs, psi_f=None):
     """Kill the offending process before unified-memory exhaustion hard-locks
     the box.  Returns a short tag for the sample line, or None.
@@ -559,7 +610,21 @@ def memory_guard(mem, dfree, procs, psi_f=None):
                       "MemAvailable and the GPU ceiling only")
         return None
 
-    if state[0] == "armed" and (now - float(state[1])) <= GUARD_CONSEC_S:
+    armed_age = None
+    if state[0] == "armed":
+        armed_age = now - float(state[1])
+
+    if armed_age is not None and armed_age < MIN_CONFIRM_AGE_S:
+        # An armed state this fresh was written by a CONCURRENT invocation
+        # seconds ago; treating it as this sample's confirmation would turn
+        # the two-sample rule into a one-sample kill.  Keep the original
+        # timestamp untouched so the honest first sighting survives.
+        guard_log(f"armed state is only {armed_age:.1f}s old (< "
+                  f"{MIN_CONFIRM_AGE_S:g}s) -- concurrent writer? not "
+                  "confirming on it")
+        return "guard:pending"
+
+    if armed_age is not None and armed_age <= GUARD_CONSEC_S:
         victim = None
         if high_gpu:
             # GPU compute-app ceiling: whoever holds that memory is the
@@ -637,6 +702,18 @@ def memory_guard(mem, dfree, procs, psi_f=None):
 
 
 def main():
+    # Whole-run exclusive lock (2026-10-25): if another invocation is
+    # mid-sample, it owns this instant -- skip everything (no sample line,
+    # no report, no guard decision) and exit 0 quietly.
+    if not _try_lock():
+        return 0
+    try:
+        return _main_locked()
+    finally:
+        _unlock()
+
+
+def _main_locked():
     util, temp, power = gpu_row()
     procs     = compute_apps()
     mem_total = sum(p[1] for p in procs) if procs else None
