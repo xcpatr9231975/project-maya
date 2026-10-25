@@ -33,7 +33,11 @@
 #   SAFE_ABORT_GIB            abort when MemAvailable < this (default 4)
 #   SAFE_SWAP_FLOOR_GIB       freeze when swap used > this (default 4)
 #   SAFE_PSI_FULL             freeze when PSI memory full avg10 > this,
-#                             two consecutive samples (default 10.0)
+#                             two consecutive samples (default 5.0; the
+#                             guard in ~/gpu_monitor.py kills at 5.0 too,
+#                             but it samples ~10 s apart while this polls at
+#                             SAFE_POLL_S, so the build freezes first and the
+#                             guard never has to pick a victim for a build)
 #   SAFE_DEVICE_FLOOR_MIB     freeze when device-free < this (default 4096;
 #                             sits above gpu_monitor's kill floor of 3072 so
 #                             the build freezes before the guard ever kills)
@@ -51,7 +55,7 @@ SAFE_POLL_S="${SAFE_POLL_S:-5}"
 SAFE_FLOOR_GIB="${SAFE_FLOOR_GIB:-8}"
 SAFE_ABORT_GIB="${SAFE_ABORT_GIB:-4}"
 SAFE_SWAP_FLOOR_GIB="${SAFE_SWAP_FLOOR_GIB:-4}"
-SAFE_PSI_FULL="${SAFE_PSI_FULL:-10.0}"
+SAFE_PSI_FULL="${SAFE_PSI_FULL:-5.0}"
 SAFE_DEVICE_FLOOR_MIB="${SAFE_DEVICE_FLOOR_MIB:-4096}"
 SAFE_DEVICE_PROBE_EVERY_S="${SAFE_DEVICE_PROBE_EVERY_S:-60}"
 SAFE_FROZEN_MAX_S="${SAFE_FROZEN_MAX_S:-300}"
@@ -176,7 +180,21 @@ cleanup() {
     fi
     kill -CONT "-$PGID" 2>/dev/null
 }
-trap cleanup EXIT INT
+# INT must exit: without the exit the script kept looping and the build kept
+# running after a Ctrl-C.  TERM is not trapped at all by default, and an
+# untrapped TERM used to leave the build running unwatched.
+on_int()  { exit 130; }
+on_term() {
+    log "TERM: stopping the build's process group"
+    term_group
+    sleep 2
+    kill -CONT "-$PGID" 2>/dev/null
+    kill_group
+    exit 124
+}
+trap cleanup EXIT
+trap on_int INT
+trap on_term TERM
 
 STATUS=0
 while kill -0 "$BUILD_PID" 2>/dev/null; do
