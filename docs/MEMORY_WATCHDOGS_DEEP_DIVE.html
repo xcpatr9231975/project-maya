@@ -909,12 +909,14 @@ allocations.</li>
 </ol>
 <p><strong>The same recipe applied to maya-S</strong>: put the engine
 under a systemd slice with <code>memory.max</code> ≈ pool + slack so a
-runaway engine fails its own allocation gracefully; shrink the
-context/kv ceiling so <code>F:</code> rests at 8+ GiB instead of 4.2
-(the GMU-margin move); make the engine refuse or queue new requests
-below a headroom threshold (vLLM’s preemption semantics). Then the guard
-demotes itself to what memwatch already is for qwen: a backstop for
-<em>external</em> allocators, not the primary defense.</p>
+runaway engine hits its own failed allocation instead of deadlocking the
+driver (untested — worst case is an engine crash + ~10 min restart,
+still far cheaper than a power-cycle); shrink the context/kv ceiling so
+<code>F:</code> rests at 8+ GiB instead of 4.2 (the GMU-margin move);
+make the engine refuse or queue new requests below a headroom threshold
+(vLLM’s preemption semantics). Then the guard demotes itself to what
+memwatch already is for qwen: a backstop for <em>external</em>
+allocators, not the primary defense.</p>
 <h3 id="gaps-future-work">Gaps / future work</h3>
 <ul>
 <li><del>gpu_monitor: pid-reuse mis-attribution window</del> — closed by
