@@ -301,6 +301,11 @@ def nvrm_errors():
     drop a line arriving within the epsilon.  The first run only
     initialises the cursor: there is no lower bound, so counting then could
     replay an old flood as a fresh breach.
+
+    The cursor advances only AFTER a successful query: a timed-out or
+    failed journalctl leaves it at `last`, so the next sample re-covers the
+    whole [last, next] window and no lines are lost -- a long journal
+    outage counts its lines once, on the first sample that succeeds.
     """
     try:
         with open(NVRM_PATH) as f:
@@ -308,12 +313,14 @@ def nvrm_errors():
     except (OSError, ValueError):
         last = None
     now = time.time()
-    try:
-        with open(NVRM_PATH, "w") as f:
-            f.write(f"{now}")
-    except OSError:
-        pass
-    if last is None or last >= now:
+    if last is None:
+        try:
+            with open(NVRM_PATH, "w") as f:
+                f.write(f"{now}")
+        except OSError:
+            pass
+        return 0
+    if last >= now:
         return 0
     try:
         r = subprocess.run(
@@ -324,6 +331,11 @@ def nvrm_errors():
         return None
     if r.returncode != 0:
         return None
+    try:
+        with open(NVRM_PATH, "w") as f:
+            f.write(f"{now}")
+    except OSError:
+        pass
     return sum(1 for ln in r.stdout.splitlines() if "NV_ERR_NO_MEMORY" in ln)
 
 
