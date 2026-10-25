@@ -6,9 +6,10 @@ This page documents the work done on this machine on 2026-10-24: bringing Projec
 (GB10), and the changes that took. It says **what every component is** and **where it comes from**, **what other
 people did** that this builds on, and **what the diff actually is** - file by file, with the reason for each change.
 
-The base is Project Maya `v1.1.26` (`f26d8ba`, the clone of
-[github.com/mw00/project-maya](https://github.com/mw00/project-maya)). Everything below is the four local commits on
-top of it: **43 files changed, +1960 / -132**.
+The base is Project Maya, and upstream's **v1.1.27** is merged in (commit `3ed58e6`), so this branch is a
+fast-forward of upstream's `main` plus the additions below. **43 files changed, +1960 / -132** over the v1.1.26
+base; the merge itself brought their 26 files and was re-tested (68/69 C++ tests, 369 server, 395 tools, and the
+benchmark re-measured at 21.2 tokens/s against 21.1 before it).
 
 | Commit | What |
 | --- | --- |

@@ -1,4 +1,4 @@
-> **This is a fork.** The canonical project is
+> **This is a fork** (upstream v1.1.27 merged in). The canonical project is
 > [mw00/project-maya](https://github.com/mw00/project-maya); this branch (`dgx-spark`) carries the
 > **aarch64 port for the NVIDIA DGX Spark (GB10) and Grace**, the prompt path's allocation-failure recovery, a
 > token-size benchmark and the Hugging Face publishing pipeline. Everything else is upstream's, unchanged.

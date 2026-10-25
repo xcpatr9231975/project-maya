@@ -13,7 +13,8 @@ repository's history.
 WHAT THIS BRANCH ADDS
 
 The `dgx-spark` branch (the default branch of this fork) carries, on top of
-upstream v1.1.26:
+upstream v1.1.27 (merged, so this branch is a fast-forward of their main
+plus these additions):
 
     Copyright (c) 2026 carlos patriawan
     Also under the MIT License.
@@ -33,12 +34,12 @@ Everything else in this branch is upstream's, unchanged. The full account of
 what the port changed, where each component comes from and what other people
 contributed is in docs/DGX_SPARK_BUILD.md.
 
-UPSTREAM'S LATER RELEASES
+UPSTREAM'S RELEASES
 
-This branch is based on v1.1.26. Upstream's releases after it (v1.1.27 at the
-time of writing) are not merged here; they are in the canonical repository and
-on this fork's `main` branch. Merging them into `dgx-spark` is a deliberate,
-tested step, not something done silently.
+Upstream v1.1.27 is merged into this branch (the merge commit says so), so
+`dgx-spark` is upstream's `main` plus the additions above - a pull request
+from it contains only this fork's work. Every upstream commit, release tag and
+credit remains in the history untouched.
 
 THIRD-PARTY COMPONENTS
 
