@@ -63,5 +63,6 @@ build-vision.bat
 /maya-bench.log
 /maya-report.txt
 
-# the agent's own workspace
-/.opencode/
+# the agent's own workspace (skills are versioned on purpose)
+/.opencode/*
+!/.opencode/skills/
