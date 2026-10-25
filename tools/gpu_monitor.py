@@ -473,16 +473,36 @@ def _rss_map():
     return d
 
 
+def _starttime(pid):
+    """Clock-tick start time of pid (stat field 22), or None when it died.
+
+    Field 22 sits after the last ')' (comm may contain them), at index 19 of
+    the remaining tokens (index i is field 3+i; _alive uses the same trick).
+    Constant for the process's lifetime within one boot, so a baseline entry
+    whose start time no longer matches belongs to a REUSED pid.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _load_rss_base():
-    """(timestamp, {pid: rss_kib}) of the last baseline, or (0, {})."""
+    """(timestamp, {pid: (rss_kib, starttime)}) of the last baseline, or
+    (0, {}).  Tolerates the pre-starttime two-token format (pid:rss) as a
+    same-process delta with no identity check."""
     try:
         with open(RSS_BASE_PATH) as f:
             parts = f.read().split()
         ts = float(parts[0])
         base = {}
         for tok in parts[1:]:
-            pid, _, rss = tok.partition(":")
-            base[int(pid)] = int(rss)
+            bits = tok.split(":")
+            if len(bits) == 3:            # pid:starttime:rss
+                base[int(bits[0])] = (int(bits[2]), int(bits[1]))
+            elif len(bits) == 2:         # legacy pid:rss
+                base[int(bits[0])] = (int(bits[1]), None)
         return ts, base
     except (OSError, ValueError, IndexError):
         return 0.0, {}
@@ -493,8 +513,10 @@ def _write_rss_base(cur):
         return
     try:
         with open(RSS_BASE_PATH, "w") as f:
-            f.write(f"{time.time()} "
-                    + " ".join(f"{p}:{r}" for p, r in cur.items()) + "\n")
+            f.write(f"{time.time()} " + " ".join(
+                f"{p}:{_starttime(p)}:{r}"
+                for p, r in sorted(cur.items()) if _starttime(p) is not None
+            ) + "\n")
     except OSError:
         pass
 
@@ -508,6 +530,12 @@ def _rss_grow_victim(cur, self_pid):
     only), so growth keeps accumulating against the pre-breach snapshot and
     a slow leak is caught on the confirming sample too.  Requires a fresh
     baseline and growth above RSS_GROW_MIN_KIB; honours the protect list.
+
+    Baseline entries carry the process start time (stat field 22), so a
+    pid that died and was REUSED inside the 300 s window cannot inherit the
+    old tenant's RSS: a mismatched start time means a fresh process whose
+    full RSS counts as growth.  A pid with no /proc/<pid>/stat any more died
+    between the sample and the pick and is skipped.
     """
     ts, base = _load_rss_base()
     if not base or time.time() - ts > RSS_BASE_MAX_AGE_S:
@@ -516,7 +544,17 @@ def _rss_grow_victim(cur, self_pid):
     for pid, rss in cur.items():
         if pid in (self_pid, 1, 2):
             continue
-        grow = rss - base.get(pid, 0)
+        st = _starttime(pid)
+        if st is None:
+            continue            # died between the sample and the pick
+        b = base.get(pid)
+        base_rss = 0
+        if b is not None:
+            brss, bst = b
+            if bst is None or bst == st:
+                base_rss = brss  # same process (or legacy entry): delta
+            # else: pid reused -- full RSS counts as growth
+        grow = rss - base_rss
         if grow > best_kib:
             best_pid, best_kib = pid, grow
     if best_pid is None or best_kib < RSS_GROW_MIN_KIB:
