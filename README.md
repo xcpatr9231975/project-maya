@@ -1,3 +1,11 @@
+> **This is a fork.** The canonical project is
+> [mw00/project-maya](https://github.com/mw00/project-maya); this branch (`dgx-spark`) carries the
+> **aarch64 port for the NVIDIA DGX Spark (GB10) and Grace**, the prompt path's allocation-failure recovery, a
+> token-size benchmark and the Hugging Face publishing pipeline. Everything else is upstream's, unchanged.
+> [docs/DGX_SPARK.md](docs/DGX_SPARK.md) is the bring-up, [docs/DGX_SPARK_BUILD.md](docs/DGX_SPARK_BUILD.md)
+> says what the port changed and where every part comes from, and [BENCHMARK.md](BENCHMARK.md) has the numbers.
+> Install it the same way: `./setup.sh`.
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B) and DeepSeek-V4.1-Flash-1017 (748 B) on your own GPU</b><br>
