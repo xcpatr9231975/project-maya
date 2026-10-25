@@ -26,6 +26,12 @@ plus these additions):
     - the prompt path's allocation-failure recovery
       (include/strata/prefill/failure.hpp, src/prefill/, src/core/glm_prefill.cu,
       src/program/generate.cpp)
+    - the memory-safety tooling for the GB10 unified-memory hard-lock
+      (tools/gpu_monitor.py, safe-build.sh, docs/2026-10-25-guard-concurrency.md):
+      the NV_ERR_NO_MEMORY kernel-log watch in gpu_monitor.py uses a
+      technique credited to MiaAI Lab's memwatch.sh (AGPL-3.0-or-later,
+      https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark);
+      it is reimplemented from scratch and no code is taken from it
     - the token-size benchmark (tools/bench_tokens.py, BENCHMARK.md)
     - the Hugging Face publishing pipeline (docs/hf-dataset/,
       docs/hf-maya-s-v2-dgx-spark-README.md)

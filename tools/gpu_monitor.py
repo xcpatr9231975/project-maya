@@ -12,10 +12,17 @@ One invocation = one sample:
  * samples MemAvailable / MemFree / PSI from /proc and runs the unified-memory
  * guard: when allocatable memory drops under the floor (or GPU memory passes
  * the ceiling) on two consecutive samples, SIGTERM the top GPU consumer and
-   escalate to SIGKILL after a grace period.  See the GUARD_* block below.
-   (2026-09-20 fix: old build wrote an unbounded report every run -> 1.45 M
-   files / 5.7 GB; also old regexes matched the May nvidia-smi layout and
-   logged only N/A ever since)
+ *   escalate to SIGKILL after a grace period.  See the GUARD_* block below.
+ * counts NV_ERR_NO_MEMORY lines the kernel log gained since the previous
+ *   sample -- literal evidence the driver is refusing allocations.  Joins
+ *   the breach set with the normal two-sample confirmation, so a lone
+ *   transient refusal recovers instead of killing.  Technique credited to
+ *   MiaAI Lab's memwatch.sh (AGPL-3.0-or-later,
+ *   github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark);
+ *   reimplemented from scratch, no code taken.
+    (2026-09-20 fix: old build wrote an unbounded report every run -> 1.45 M
+    files / 5.7 GB; also old regexes matched the May nvidia-smi layout and
+    logged only N/A ever since)
 
 Failure mode: if every GPU query fails the sample line still lands (all N/A)
 but exit code is 1 -> systemd Restart=on-failure retries in 60 s.
@@ -128,6 +135,12 @@ _PROTECT_TOKENS       = {t.strip() for t in
 STATE_PATH            = os.path.join(HOME, ".gpu_monitor_guard_state")
 WARN_PATH             = os.path.join(HOME, ".gpu_monitor_guard_warned")
 GUARD_LOG_PATH        = os.path.join(HOME, "gpu_monitor_guard.log")
+
+# NV_ERR_NO_MEMORY journal watch (2026-10-25, technique credited to MiaAI
+# Lab's memwatch.sh in the header): cursor file keeps the last window's
+# timestamp so the one-shot process can count only NEW kernel-log lines.
+NVRM_PATH             = os.path.join(HOME, ".gpu_monitor_guard_nvrm")
+NVRM_JOURNAL_TIMEOUT  = 10
 
 
 def _q(args, timeout=15):
@@ -275,6 +288,43 @@ def psi_memory():
         m = re.search(rf"^{key}\s+avg10=([\d.]+)", txt, re.M)
         out.append(float(m.group(1)) if m else None)
     return out[0], out[1]
+
+
+def nvrm_errors():
+    """Count of NV_ERR_NO_MEMORY lines the kernel log gained since the
+    previous sample, or None when the journal is unavailable.
+
+    Windows are adjacent [last, now] via epoch cursors in NVRM_PATH.
+    journalctl's --since/--until are inclusive at the boundary instant, so a
+    line stamped exactly at the boundary can double-count -- harmless for a
+    trigger, and preferred over a since=last+eps window that could silently
+    drop a line arriving within the epsilon.  The first run only
+    initialises the cursor: there is no lower bound, so counting then could
+    replay an old flood as a fresh breach.
+    """
+    try:
+        with open(NVRM_PATH) as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        last = None
+    now = time.time()
+    try:
+        with open(NVRM_PATH, "w") as f:
+            f.write(f"{now}")
+    except OSError:
+        pass
+    if last is None or last >= now:
+        return 0
+    try:
+        r = subprocess.run(
+            ["journalctl", "-k", "-q", "--no-pager",
+             f"--since=@{last}", f"--until=@{now}"],
+            capture_output=True, text=True, timeout=NVRM_JOURNAL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return sum(1 for ln in r.stdout.splitlines() if "NV_ERR_NO_MEMORY" in ln)
 
 
 def guard_log(msg):
@@ -524,7 +574,7 @@ def _unlock():
         _LOCK_FD = None
 
 
-def memory_guard(mem, dfree, procs, psi_f=None):
+def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
     """Kill the offending process before unified-memory exhaustion hard-locks
     the box.  Returns a short tag for the sample line, or None.
 
@@ -539,10 +589,17 @@ def memory_guard(mem, dfree, procs, psi_f=None):
       4. PSI memory full avg10 at/above PSI_FULL_FLOOR for two consecutive
          samples - the kernel saying allocation is already stalling.
       5. swap used at/above SWAP_FLOOR_GIB - the pre-lock thrash signature.
+      6. NV_ERR_NO_MEMORY lines new in the kernel log since the previous
+         sample - the driver literally refusing an allocation.  Arms like
+         any breach; the two-sample confirmation still applies, so one
+         transient refusal that the engine retried past recovers.
 
-    Victim: a GPU-pool breach (1 or 3) kills the top GPU consumer, as before.
-    An OS-side-only breach (2, 4, 5) picks the biggest-RSS process instead
-    (see _os_victim), because the offender there often holds no GPU memory.
+    Victim: a GPU-pool breach (1, 3 or 6) kills the top GPU consumer, as
+    before -- with 2026-10-25 growth attribution first, since on GB10 the
+    pool IS system RAM and an RSS hog can cause (1) and (6) without holding
+    any GPU memory.  An OS-side-only breach (2, 4, 5) picks the biggest-RSS
+    process instead (see _os_victim), because the offender there often
+    holds no GPU memory.
 
     One invocation is one sample, so the two-sample confirmation has to live
     in the state file:
@@ -581,14 +638,17 @@ def memory_guard(mem, dfree, procs, psi_f=None):
     low_avail = availg is not None and availg < MEM_FLOOR_GIB
     high_gpu = gpu > GPU_CEIL_MIB
     low_psi = psi_f is not None and psi_f >= PSI_FULL_FLOOR
+    nvrm_hit = nvrm is not None and nvrm > 0
     swap_used = None
     st = mem.get("SwapTotal")
     sf = mem.get("SwapFree")
     if st is not None and sf is not None:
         swap_used = (st - sf) / 1048576.0
     high_swap = swap_used is not None and swap_used >= SWAP_FLOOR_GIB
+    pool_breach = low_free or nvrm_hit      # driver-pool family: (1), (3), (6)
 
-    if not (low_free or low_avail or high_gpu or low_psi or high_swap):
+    if not (low_free or low_avail or high_gpu or low_psi or high_swap
+            or nvrm_hit):
         _REBASE_OK = True
         if state[0] == "armed":
             _set_state("")
@@ -631,7 +691,7 @@ def memory_guard(mem, dfree, procs, psi_f=None):
             # culprit by definition.
             if procs:
                 victim = max(procs, key=lambda p: p[1])          # (pid, MiB, name)
-        elif low_free and OS_VICTIM_BY_RSS:
+        elif pool_breach and OS_VICTIM_BY_RSS:
             # 2026-10-25: device memory IS RAM on GB10, so a device-free
             # breach can be caused by a plain RSS hog that holds no GPU
             # memory at all (an unwrapped build, say) -- killing the engine
@@ -647,7 +707,7 @@ def memory_guard(mem, dfree, procs, psi_f=None):
                           f"+{vgrow / 1048576:.1f}GiB since last sample)")
             elif procs:
                 victim = max(procs, key=lambda p: p[1])
-        elif low_free:
+        elif pool_breach:
             # growth attribution disabled -> old behaviour
             if procs:
                 victim = max(procs, key=lambda p: p[1])
@@ -683,6 +743,8 @@ def memory_guard(mem, dfree, procs, psi_f=None):
             why.append(f"psi_full {psi_f}% >= {PSI_FULL_FLOOR}%")
         if high_swap:
             why.append(f"swap {swap_used:.1f}GiB >= {SWAP_FLOOR_GIB:.0f}GiB")
+        if nvrm_hit:
+            why.append(f"nvrm {nvrm} NV_ERR_NO_MEMORY since last sample")
         guard_log(f"LOW {'; '.join(why)} -> SIGTERM "
                   f"{name}(pid {pid}, {int(mib)}MiB)")
         if _signal_pid(pid, signal.SIGTERM):
@@ -695,7 +757,8 @@ def memory_guard(mem, dfree, procs, psi_f=None):
           (f"mem_available {availg:.1f}GiB" if low_avail else
            (f"gpu {int(gpu)}MiB" if high_gpu else
             (f"psi_full {psi_f}%" if low_psi else
-             f"swap {swap_used:.1f}GiB")))
+             (f"nvrm {nvrm} since last sample" if nvrm_hit else
+              f"swap {swap_used:.1f}GiB"))))
     guard_log(f"LOW {why} -> armed, needs a confirming sample within "
               f"{GUARD_CONSEC_S:.0f}s")
     return "guard:armed"
@@ -720,7 +783,8 @@ def _main_locked():
     mem       = meminfo()
     psi_s, psi_f = psi_memory()
     dfree, dtotal = device_free()
-    guard     = memory_guard(mem, dfree, procs, psi_f)
+    nvrm_new  = nvrm_errors()
+    guard     = memory_guard(mem, dfree, procs, psi_f, nvrm_new)
     # Rebase the RSS baseline only on a healthy sample: mid-breach the
     # pre-breach snapshot is what makes growth attribution work on the
     # confirming sample, so it must survive.
@@ -738,10 +802,12 @@ def _main_locked():
     avail_s = f"{avail / 1048576:.1f}GiB" if avail is not None else "N/A"
     dfree_s = f"{dfree / 1024:.2f}GiB" if dfree is not None else "N/A"
     psi_s   = f"{fmt(psi_s, '%')}/{fmt(psi_f, '%')}"
+    nvrm_s  = "N/A" if nvrm_new is None else str(nvrm_new)
 
     line = (f"[{ts}] GPU: NVIDIA GB10 | U:{fmt(util, '%')} | "
             f"T:{fmt(temp, deg + 'C')} | P:{fmt(power, 'W')} | "
-            f"M:{fmt(mem_total, 'MiB')} | F:{dfree_s} | A:{avail_s} | proc: {plist}")
+            f"M:{fmt(mem_total, 'MiB')} | F:{dfree_s} | A:{avail_s} | "
+            f"N:{nvrm_s} | proc: {plist}")
     if guard:
         line += f" | {guard}"
     line += "\n"
@@ -765,6 +831,7 @@ def _main_locked():
         f.write(f"{'MemAvailable':<14}{avail_s:>16}\n")
         f.write(f"{'MemFree':<14}{kib(mem.get('MemFree')):>16}\n")
         f.write(f"{'PSI some/full':<14}{psi_s:>16}\n")
+        f.write(f"{'NV_ERR_NO_MEMORY':<14}{nvrm_s:>16}\n")
         f.write("-" * 30 + "\n")
         for pid, m, n in sorted(procs, key=lambda p: -p[1]):
             f.write(f"{n[:20]:<20} pid {pid:<9} {int(m):>8} MiB\n")
