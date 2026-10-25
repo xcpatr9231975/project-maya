@@ -105,16 +105,16 @@ It was built here with CUDA for sm_121a (`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTU
 
 | prompt (tokens) | Maya (tokens/s) | llama.cpp (tokens/s) | Maya / llama.cpp |
 | ---: | ---: | ---: | ---: |
-| 256 | 225 | 234 | 0.96x |
-| 512 | 302 | 314 | 0.96x |
-| 1024 | 456 | 313 | 1.46x |
-| 2048 | 625 | 308 | 2.03x |
-| 4096 | 704 | 295 | 2.39x |
-| 8192 | 746 | 277 | 2.69x |
-| 16384 | 765 | 263 | 2.91x |
-| 32768 | 756 | 239 | 3.16x |
+| 256 | 222 | 234 | 0.95x |
+| 512 | 303 | 314 | 0.96x |
+| 1024 | 452 | 313 | 1.44x |
+| 2048 | 619 | 308 | 2.01x |
+| 4096 | 708 | 295 | 2.40x |
+| 8192 | 744 | 277 | 2.69x |
+| 16384 | 769 | 263 | 2.92x |
+| 32768 | 754 | 239 | 3.16x |
 
-llama.cpp's rate is flat at 230-315 tokens/s whatever the prompt's size; Maya's keeps rising to 765. The two agree
+llama.cpp's rate is flat at 230-315 tokens/s whatever the prompt's size; Maya's keeps rising to 769. The two agree
 at the shortest prompts (both are bound by the same fixed costs there) and part company from 1K tokens on: at 32K
 tokens Maya reads the prompt 3.2x faster - 43 s instead of 137 s.
 

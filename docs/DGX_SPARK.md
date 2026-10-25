@@ -186,8 +186,8 @@ glm stat: decode 59.34 ms/tok (16.85 tok/s) | vram hit 99.97% | ram fetches 0.00
 Every expert sits in the pool (12 096 of 12 096), so a token needs no disk and no RAM: the experts are read into the
 pool at 8.7 GB/s at the start (86 GB in 10 s), and the decode is bound by the kernels.
 
-These numbers match the DGX Spark row in the README's table (16.5 tokens/s, ~730 tokens/s on a 6K prompt, reported
-by @ericoh88 on v1.1.15).
+These numbers reproduce the earlier DGX Spark row in the README's table (16.5 tokens/s, ~730 tokens/s on a 6K
+prompt, reported by @ericoh88 on v1.1.15); the row above it is this build, at 21.1 tokens/s with the drafter.
 
 ## Drafting (DFlash2) and several requests at once
 

@@ -28,7 +28,7 @@ Nothing was pushed: the four commits are local, 4 ahead of `origin/main`.
 | Machine | one NVIDIA DGX Spark: GB10 GPU (compute capability 12.1, `sm_121`), 20 ARM cores, **120 GB of RAM shared with the GPU** |
 | Software | Ubuntu 24.04 aarch64, driver 580.95.05, CUDA 13.0 (nvcc 13.0.88) |
 | Model | `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS`, 89.83 GiB, 320.76 B parameters (18 B active), 46 layers, 288 experts (8 used), 1M-token context, run at 131072 |
-| Result | 16.8 tokens/s decoding, 765 tokens/s reading a 16K-token prompt, every expert resident, 99.97% cache hit |
+| Result | 21.1 tokens/s decoding with the DFlash2 drafter (16.8 without it), 769 tokens/s reading a 16K-token prompt, every expert resident, 99.97% cache hit |
 
 The one thing that makes a DGX Spark different from every machine Maya ran on before: **the GPU has no VRAM of its
 own**. Its memory is the system's RAM, so the expert pool, the prompt buffers, the pinned tiers and the desktop all
@@ -154,7 +154,7 @@ hit, a 42-second restart - matching @ericoh88's reported numbers on the same har
   256-32768 tokens with the time to its first token, and the answer written at 32-1024 tokens after a prompt of a
   given size. It drives the engine alone, the way the dashboard starts it.
 - `BENCHMARK.md` (**new**): the numbers on this machine, and **the same GGUF on the same GPU with upstream
-  llama.cpp** (`272aad8b9`, built here for `sm_121a`). Prefill: 756 vs 239 tokens/s at 32K tokens (**3.16x**).
+  llama.cpp** (`272aad8b9`, built here for `sm_121a`). Prefill: 754 vs 239 tokens/s at 32K tokens (**3.16x**).
   Decode: a tie at a short context (17.4 vs 17.7) and 1.03-1.07x Maya's way as the context grows (upstream loses
   ~12% of its rate between an empty context and 2K tokens, Maya ~4%).
 

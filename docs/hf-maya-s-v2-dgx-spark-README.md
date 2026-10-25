@@ -48,9 +48,9 @@ project's own setup (`maya.py`).
 
 | | |
 | --- | --- |
-| Decode (256-token answers) | **16.8 tokens/s** |
-| Prefill (8K-token prompt) | **730 tokens/s** |
-| Prompt read at 16K tokens | 765 tokens/s |
+| Decode (256-token answers) | **21.1 tokens/s** (with the DFlash2 drafter; 16.8 without it) |
+| Prefill (8K-token prompt) | **732 tokens/s** |
+| Prompt read at 16K tokens | 769 tokens/s |
 | Expert cache hit | 99.97% |
 | Experts resident | 12 096 of 12 096 (80.17 GB of the 120 GB shared with the GPU) |
 | Context | 131 072 tokens (the model supports 1 M) |
@@ -66,12 +66,17 @@ architecture, built for `sm_121a`):
 
 | | Maya | llama.cpp |
 | --- | ---: | ---: |
-| Prefill, 32K-token prompt | 756 tok/s | 239 tok/s (**3.2x**) |
-| Prefill, 8K-token prompt | 746 tok/s | 277 tok/s (**2.7x**) |
-| Prefill, 512-token prompt | 302 tok/s | 314 tok/s (tie) |
-| Decode, short context | 17.4 tok/s | 17.7 tok/s (tie) |
-| Decode, 2K-token context | 16.8 tok/s | 15.7 tok/s (1.07x) |
-| Decode, 9K-token context | 16.1 tok/s | 15.6 tok/s (1.03x) |
+| Prefill, 32K-token prompt | 754 tok/s | 239 tok/s (**3.2x**) |
+| Prefill, 8K-token prompt | 744 tok/s | 277 tok/s (**2.7x**) |
+| Prefill, 512-token prompt | 303 tok/s | 314 tok/s (tie) |
+| Decode, 256-token answer, short context | 22.9 tok/s | 17.5-17.8 tok/s (**1.29x**) |
+| Decode, 256-token answer, 2K context | 22.9 tok/s | 15.7 tok/s (**1.46x**) |
+| Decode, 256-token answer, 8K context | 21.1 tok/s | 15.6 tok/s (**1.35x**) |
+
+The decode rows are Maya **with** its DFlash2 drafter. llama.cpp has no drafter to compare with: the pack has no MTP
+draft block, and this llama.cpp build has no DFlash2 - so the decode comparison is the engine against the engine plus
+a drafter. Without it Maya's decode is a tie at a short context (17.4 against 17.7) and 3-7% faster at a long one
+(16.8 against 15.7 at a 2K-token context).
 
 ## The machine
 
