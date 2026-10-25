@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Feeding a 321B model from 119 GB — Maya's expert tiers</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+  <style>
+  body{max-width:900px;margin:2em auto;padding:0 1em;font-family:-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.55;color:#1a1a1a}
+  h1,h2,h3{border-bottom:1px solid #ddd;padding-bottom:.2em}
+  table{border-collapse:collapse;margin:1em 0;font-size:.92em}
+  th,td{border:1px solid #bbb;padding:4px 8px;text-align:left}
+  th{background:#f0f0f0}
+  pre{background:#f6f8fa;padding:.7em 1em;border-radius:6px;overflow-x:auto;font-size:.9em}
+  code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:.92em}
+  pre code{background:none;padding:0}
+  blockquote{border-left:4px solid #ccc;margin:1em 0;padding:.2em 1em;color:#555}
+  hr{border:none;border-top:2px solid #eee;margin:2em 0}
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Feeding a 321B model from 119 GB — Maya's expert
+tiers</h1>
+</header>
+<h1 id="feeding-a-321b-model-from-119-gb-mayas-expert-tiers">Feeding a
+321B model from 119 GB: Maya’s expert tiers</h1>
+<p><strong>What this is.</strong> A plain-language walk through how Maya
+runs GLM-5.3-Flash — 321B parameters, about 18B active per token — out
+of a single 119 GB pool of unified memory on one DGX Spark, and why that
+is a different <em>infrastructure</em> from loading a GGUF and hoping it
+fits. Every claim below is either measured on a live run (numbers marked
+<strong>[measured]</strong>, with the run they came from) or cited to
+the source that implements it.</p>
+<p><strong>Who it is for.</strong> Anyone who has watched a 3-bit GGUF
+of this model sit “not responding” on a Spark and wants to know what
+Maya does instead.</p>
+<hr />
+<h2 id="the-problem-in-one-paragraph">0. The problem, in one
+paragraph</h2>
+<p>The model is 321B parameters; each token routes through about 18B of
+them. At 3 bits a weight that is roughly 100 GB of expert bytes plus a
+few GB of dense weights — call it 91 GB, which is what the shipped
+Maya-S pack measures on disk. The box has 119 GB of LPDDR5x, and that
+memory is <strong>the same pool for the CPU and the GPU</strong>:
+<code>docs/DGX_SPARK.md:293</code> — <em>“the device allocates from the
+same RAM the CPU uses”</em>. There is no discrete VRAM to add, and no
+second pool to spill into. So the engineering question is not “does it
+fit” (it does, barely) but <strong>“which parts of it can afford the
+fast access path, and can the rest be fetched before they are
+wanted?”</strong></p>
+<h2 id="why-one-blob-fails">1. Why one blob fails</h2>
+<p>A generic runtime treats a GGUF as one file of equal citizens. Either
+the weights fit in memory or they do not; when they do not, whole layers
+stream per token. At ~91 GB of weights on 119 GB, the model “fits” — and
+leaves roughly 19 GB for the KV cache, activations and the MoE working
+set. A real context is several GB on its own, so the first long prompt
+pushes the box into the streaming regime, where every token pays for
+weights it will never use again. That is the wall: not capacity, but the
+absence of any notion that <strong>some experts matter more than
+others</strong>.</p>
+<h2 id="one-pool-three-access-paths">2. One pool, three access
+paths</h2>
+<p>The three “tiers” are not three places. They are three
+<strong>allocation modes of the same physical memory</strong>, with very
+different costs for the GPU to reach:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>tier</th>
+<th>allocated as</th>
+<th>how the GPU reaches it</th>
+<th>cost per expert</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>VRAM</strong></td>
+<td><code>cudaMalloc</code> — device memory</td>
+<td>an ordinary global load from the kernel</td>
+<td>~0 (already resident)</td>
+</tr>
+<tr>
+<td><strong>RAM</strong></td>
+<td><code>cudaHostAlloc</code> / <code>cudaHostRegister</code> — pinned
+host</td>
+<td>through the host mapping over NVLink-C2C</td>
+<td><strong>0.127 ms</strong> [measured]</td>
+</tr>
+<tr>
+<td><strong>disk</strong></td>
+<td>the GGUF shards on the NVMe</td>
+<td>an <code>O_DIRECT</code> read by a reader thread</td>
+<td><strong>~1.2 ms</strong> [measured, derived]</td>
+</tr>
+</tbody>
+</table>
+<p>The 0.127 ms and the 0.161 ms CPU figure are printed by the engine at
+startup (<code>src/core/glm_fast_path.cu:3317</code>); the ~1.2 ms disk
+figure is the disk time per read from a live 256K run (28.53 ms of disk
+waits across 23.50 reads per token). The tiers are
+<strong>exclusive</strong> — an expert is in exactly one mode at a time,
+because duplicating it would cost twice the capacity for no gain
+(<code>src/core/glm_fast_state.hpp:585</code>).</p>
+<p>That exclusivity is also why the tier split is a zero-sum negotiation
+<em>on this box</em> and not on a discrete-GPU machine: growing the RAM
+tier takes bytes from the VRAM tier, and a VRAM-resident expert is
+strictly better than a RAM-resident one. On an H100 with 80 GB of VRAM
+and 504 GB of system RAM the two pools never compete, which is why the
+README’s 2x H100 entry runs 1M context at 122 tok/s.</p>
+<h2 id="the-pack-addressed-not-copied">3. The pack: addressed, not
+copied</h2>
+<p><code>./setup.sh</code> converts the downloaded GGUF into a
+<strong>pack</strong> (<code>tools/iq_pack.py</code>). For the shipped
+Maya-S pack that is:</p>
+<pre><code>pack/index.txt            1257 tensors: the table the engine loads
+pack/dense.bin            901 MB — attention, norms, embeddings
+pack/native_experts.txt   42 lines, one per expert layer: quant types + BYTE OFFSETS
+pack/tokenizer/           the tokenizer and chat template</code></pre>
+<p>The line that matters is the last one. The <strong>86 GB of experts
+are never copied</strong>. <code>native_experts.txt</code> records, per
+layer, the gate/up and down quant types and the absolute offset of each
+expert’s blob <em>inside the original GGUF shards</em>, so the engine
+reads an expert in place at a known offset. The pack is an index plus
+the dense weights — not a second copy of the model.</p>
+<p>The pack also records the quant format <strong>per layer</strong>
+(<code>gu_type</code>/<code>d_type</code>), because a real quant mixes
+formats across layers and a kernel that assumes one format for all of
+them would silently misread the rest.</p>
+<h2 id="starting-warm-the-profile">4. Starting warm: the profile</h2>
+<p>Residency is not left to chance. <code>tools/make_profile.py</code>
+ranks every <code>(layer, expert)</code> pair by routing frequency,
+measured over a trace, and <code>--expert-profile</code> loads that
+ranking. For this model that is <strong>42 layers x 288 experts = 12,096
+pairs</strong>, and the engine fills its <strong>9,439 VRAM slots — 78%
+of them — with the hottest pairs before the first token</strong>
+[measured: <em>“tiers warm: 9,493 experts (67.6 GB) in 8 s (8.69
+GB/s)”</em>].</p>
+<p>The alternative the code comments describe and reject is
+compulsory-miss filling — whatever the first prompt happened to touch —
+which measured <code>h = 0.4864</code> against the profile’s
+<code>0.6447</code>
+(<code>include/strata/core/expert_cache.hpp</code>).</p>
+<h2 id="the-per-token-dispatch">5. The per-token dispatch</h2>
+<p>Per layer, the router picks its experts and the host
+<strong>plans</strong> the layer (<code>GpuPlanSink</code>,
+<code>src/core/expert_source.hpp:106</code>). Every routed id is looked
+up in the residency table and sorted into:</p>
+<ul>
+<li><strong>hit groups</strong> — resident experts, read straight from
+the VRAM arena by the GPU’s grouped kernel, one device pointer per
+group;</li>
+<li><strong>PCIe groups</strong> — RAM-tier misses, staged into a
+staging arena by the copy engine, or read directly from the mapped host
+arena;</li>
+<li><strong>CPU-lane jobs</strong> — the flat-batch pool in
+<code>src/kernels/cpu/pool.hpp</code>, whose entire header is a
+concurrency protocol (epoch-tagged claims, so a worker that woke late
+cannot claim a job from the next batch).</li>
+</ul>
+<p>The plan is <em>published to the device</em>, so the GPU works
+through a layer without the host in the loop per layer. On the Spark the
+CPU lane essentially never wins — the measured split is 0.161 ms on the
+CPU against 0.127 ms over the link, which is why a live run reports
+<code>cpu lane 0.00/tok</code>.</p>
+<h2 id="the-movers">6. The movers</h2>
+<p>Three mechanisms keep the tiers from being a static snapshot:</p>
+<p><strong>Adaptive swaps</strong>
+(<code>src/core/glm_fast_path.cu:2142</code>, <code>:5152</code>).
+Per-layer usage counters decay, and at a boundary the engine promotes a
+layer’s hottest RAM-only expert into a free VRAM slot; with none free it
+demotes the least-used resident when a RAM-only expert is used
+<code>bg_ratio</code> (2) times as much. The rule that makes it safe:
+<strong>the expert stays live where it was until its copy lands</strong>
+— the slot state machine
+(<code>kFree/kResident/kSpare/kDraining/kLent/kLanding</code>,
+<code>src/core/glm_fast_state.hpp:501</code>) tracks the move, so no
+route ever falls to disk mid-swap.</p>
+<p><strong>Lookahead</strong>
+(<code>src/core/glm_fast_state.hpp:398</code>). Every route also names
+the top-k of the <em>next</em> layers’ routers on this layer’s input, so
+disk-only experts among them are read into the RAM tier by reader
+threads while the layers in between compute.</p>
+<p><strong>KV streaming and lending.</strong> A long context keeps its
+attention cells in VRAM rows rather than one block per layer, and the
+prompt path can <em>lend</em> VRAM slots to its scratch and hand them
+back — with the eviction bookkeeping to say what that cost.</p>
+<h2 id="what-it-looks-like-live">7. What it looks like live</h2>
+<p>The same pack, two context sizes, one box. Both from real runs; the
+128K figures are the ones the bring-up documents.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>128K (documented)</th>
+<th>256K [measured]</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>decode</td>
+<td>15-17 tok/s</td>
+<td>82.07 ms/tok = <strong>12.19 tok/s</strong></td>
+</tr>
+<tr>
+<td>expert cache hit</td>
+<td>99.7%</td>
+<td>91.25% -&gt; 95.20% (climbing)</td>
+</tr>
+<tr>
+<td>RAM-tier fetches</td>
+<td>—</td>
+<td>0.67/tok</td>
+</tr>
+<tr>
+<td>disk reads</td>
+<td>—</td>
+<td><strong>23.50/tok, 28.53 ms/tok</strong></td>
+</tr>
+<tr>
+<td>VRAM tier</td>
+<td>—</td>
+<td>9,297 / 9,439 slots (<strong>full</strong>)</td>
+</tr>
+<tr>
+<td>RAM tier</td>
+<td>—</td>
+<td>16 / 33 slots (<strong>nearly empty</strong>)</td>
+</tr>
+</tbody>
+</table>
+<p>Read the last two rows against §2 and the whole story falls out: at
+256K the VRAM tier saturated, so promotion has nowhere to put anything,
+and the RAM tier is nearly empty, so a miss has nothing to hit and falls
+through to disk — a third of every token. The startup line says where
+the memory went (<code>src/core/glm_fast_path.cu:1088</code>):</p>
+<pre><code>VRAM before the expert pool: 38.56 of 119.07 GB in use
+  dense weights 6.86, state/KV (262144 ctx) 0.92, activations 0.06,
+  other (context, MTP, scratch, prompt path) 30.73</code></pre>
+<p>The KV itself is under a gigabyte. It is the <strong>30.73 GB of
+“other”</strong> — context structures, the MTP drafter, the prompt
+path’s scratch — that 256K took, and that is what starved the RAM tier
+down to 33 slots.</p>
+<h2 id="the-knobs-in-the-order-they-pay">8. The knobs, in the order they
+pay</h2>
+<ol type="1">
+<li><strong><code>STRATA_GLM_RAM_HEADROOM_GB</code></strong> (default 24
+in <code>run-maya-maya-s-v2-iq2_xxs.sh</code>) — what the tier sizing
+leaves for the CPU side. It is the difference between a RAM tier of 33
+slots and one of thousands; every slot added turns a ~1.2 ms disk read
+into a 0.127 ms link fetch. It is also the margin against the hard-lock
+in §0, so it is not a free parameter.</li>
+<li><strong>Context size.</strong> 128K hands ~15 GB back to the tiers
+and buys the documented 99.7% hit and 15-17 tok/s.</li>
+<li><strong><code>--pcie-frac</code></strong> — the share of misses sent
+over the link rather than to the CPU lane.</li>
+<li><strong><code>STRATA_GLM_AHEAD</code> /
+<code>STRATA_GLM_PROMOTE</code></strong> — lookahead depth and the
+background promotion’s aggressiveness.</li>
+</ol>
+<p>None of these is a hardware upgrade, and on this box there isn’t one
+available: the NVMe is already a datacenter-class drive (the 28.5
+ms/token is 23.5 random reads happening <em>at all</em>, not a slow disk
+— the engine’s own notes call this regime <em>“latency and not
+bandwidth”</em>), and the 119 GB is the package’s unified LPDDR5x,
+soldered.</p>
+<h2 id="sources">9. Sources</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>claim</th>
+<th>where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>unified memory, the hard-lock, no OOM killer</td>
+<td><code>docs/DGX_SPARK.md:293</code></td>
+</tr>
+<tr>
+<td>the VRAM tier, the residency table, no eviction, the profile over
+compulsory-miss</td>
+<td><code>include/strata/core/expert_cache.hpp</code></td>
+</tr>
+<tr>
+<td>the RAM tier, exclusive tiers, slot states, lookahead</td>
+<td><code>src/core/glm_fast_state.hpp:501,:585,:398</code></td>
+</tr>
+<tr>
+<td>the layer plan, hit/PCIe/CPU groups, staging</td>
+<td><code>src/core/expert_source.hpp:106</code></td>
+</tr>
+<tr>
+<td>the CPU pool’s concurrency protocol</td>
+<td><code>include/strata/kernels/cpu/pool.hpp</code></td>
+</tr>
+<tr>
+<td>the RAM tier’s NUMA spread, the startup sizing line, the CPU-vs-link
+split, adaptive swaps</td>
+<td><code>src/core/glm_fast_path.cu:294,:1088,:3317,:2142,:5152</code></td>
+</tr>
+<tr>
+<td>the pack format and the in-place expert offsets</td>
+<td><code>tools/iq_pack.py</code></td>
+</tr>
+<tr>
+<td>the residency profile</td>
+<td><code>tools/make_profile.py</code></td>
+</tr>
+<tr>
+<td>the pack’s own numbers (layers, experts, bytes)</td>
+<td><code>pack/native_experts.txt</code>, <code>pack/index.txt</code> of
+the shipped Maya-S pack</td>
+</tr>
+<tr>
+<td>the 128K figures</td>
+<td><code>CHANGELOG.md</code>, the DGX Spark bring-up entry</td>
+</tr>
+<tr>
+<td>the 256K figures</td>
+<td>a live 256K run of <code>maya-maya-s-v2-iq2_xxs-256k.json</code>,
+2026-10-25</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

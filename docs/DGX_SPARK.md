@@ -326,7 +326,8 @@ is subtracted. The start log says what it took (`pool budget ... GB`); compare i
 
 **The decode is slower than the table says** - check the engine's `glm stat:` line. `vram hit` below 99% means the
 experts are not all resident (the pool was too small), and `cpu lane` above zero means the CPU is computing experts
-it should not.
+it should not. How the three expert tiers work, and what a long context costs them, is in
+[EXPERT_TIERS.md](EXPERT_TIERS.md) (+ [html](EXPERT_TIERS.html)).
 
 **The build fails in ggml** - check the `-march=` line in the configure output. It comes from `/proc/cpuinfo`'s
 feature list; a CPU without `i8mm` gets a smaller one.
