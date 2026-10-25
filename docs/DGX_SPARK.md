@@ -288,6 +288,32 @@ the size): with four running, the VRAM hit was 99.8% and a token saw 0.67 disk r
 - **`ple_parity`** (a C++ test) needs the maintainer's fixtures - the Qwen3.8-Flash-Next GGUF and
   `bench/micro/ple_*.bin` - and fails without them on any machine, not only here.
 
+## Memory safety (the watchdogs this box runs)
+
+On a GB10 the device allocates from the same RAM the CPU uses, and when that pool runs out the driver returns
+`NV_ERR_NO_MEMORY` on an error path that deadlocks: the box hard-locks, nothing reaches the console, and with the
+kernel watchdog disabled ("NMI not fully supported") only a power-cycle recovers it. No OOM killer comes first,
+because the driver does not charge its pages to a cgroup - the engine holds ~90 GB while its cgroup reports ~4 GB.
+So the repo ships its own, and they are ordered so a build freezes before the guard kills:
+
+- **`safe-build.sh`** (repo root) wraps a build or any command: pre-flight refusal, its own session/process group
+  (one signal reaches every compiler), and a 5 s watchdog that SIGSTOPs the whole group when MemAvailable, swap,
+  PSI or device-free cross their floors (device-free is probed every 15 s - a -j4 compiler ramp crossed the
+  guard's kill floor in ~40 s in the 2026-10-25 drill). Frozen and recovered it resumes; frozen too long or
+  deeper than the abort floor it terminates the group. Always build through it on this box.
+- **`tools/gpu_monitor.py`** (deployed at `~/gpu_monitor.py`, driven by `gpu_monitor.timer` at a ~10 s cadence) is
+  the system guard: device-free below 3072 MiB (via `cudaMemGetInfo`, the only reading that saw the failure
+  coming - `MemAvailable` still reads ~20 GB while the driver is 1 GB from refusing), MemAvailable, the GPU
+  ceiling, PSI-full and swap floors, plus the `NV_ERR_NO_MEMORY` lines the kernel log gains per sample. A breach
+  arms; a later sample confirms and SIGTERMs the offender - by RSS growth since the last healthy baseline (a
+  process holding no GPU memory can still drain the pool), else the top GPU consumer - then SIGKILL after a 30 s
+  grace. The two-sample rule survives concurrent invocations
+  ([docs/2026-10-25-guard-concurrency.md](2026-10-25-guard-concurrency.md)), and the journal watch is a technique
+  credited to MiaAI Lab's memwatch.sh in [NOTICE](../NOTICE) (AGPL-3.0-or-later, reimplemented from scratch).
+  Its state lives in `~/.gpu_monitor_guard_*` files; redeploying the script needs no restart, the timer re-runs it.
+- The tests for the guard's baseline identity and journal cursor run in CI:
+  `python -m unittest tools.test_gpu_monitor_baseline tools.test_gpu_monitor_nvrm`.
+
 ## Troubleshooting
 
 **"has no room for the expert pool"** - the pool came out too small for one route's experts in every layer. On a
