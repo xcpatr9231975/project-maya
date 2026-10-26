@@ -307,20 +307,21 @@ record survival on this box was 1h45m, not 11h.
 
 ## What is still open
 
-- **Admission control** — the engine still admits a prefill without checking that the
-  device has room for it, so a prompt longer than the ones measured here can still end in
-  a guard kill. The parameters are tuned for the prompts that were measured (115k and
-  239k tokens); the check that would make any prompt safe is missing. `docs/STABILITY-1.md`
-  §6.2 has the shape of it: `free >= borrow + floor` before the request is admitted turns
-  a kill into a queue.
+The three remaining gaps, with their evidence, their cost and their acceptance tests, are
+written up in [ENHANCEMENT.md](ENHANCEMENT.md). In short:
+
 - **The session store moves the budget under the parameter** — restoring four 115k
   conversations grew the pre-pool footprint by 13.6 GB, and the headroom is computed from
   MemAvailable at boot, so a restart can turn a comfortable config into a tight one.
-  Nothing prunes the store automatically.
+  Nothing prunes the store automatically. (The engine's own knobs — `STRATA_GLM_SLOTS`
+  and friends — can cap it without a rebuild; that is item A in the enhancement page.)
 - **The guard's stall detector** false-positives on engines started by another harness
   (see above), and its NVRM rule kills the *biggest* consumer, which is not always the
-  one that failed to allocate.
-- **The stale 6.14/6.11 kernels** are still installed (see the upgrade hand-off).
+  one that failed to allocate. (Item B.)
+- **The stale 6.14/6.11 kernels** are still installed (see the upgrade hand-off). (Item D.)
+
+Admission control — the gate that stops a request from starting when the device cannot
+hold it — is **done**: see the section above.
 
 ## Landmines closed during the upgrade
 
