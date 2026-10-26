@@ -567,6 +567,7 @@ class StrataEngine:
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
+        self.may_be_writing = False      # a drain that gave up: the next request skips the stale lines first
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
@@ -1028,10 +1029,37 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def _skip_stale_lines(self) -> None:
+        """Consume-and-discard the lines of a request the drain gave up on.
+
+        The engine's answers are an untagged stream on one queue: when a client vanishes mid-request and the
+        engine does not end within STRATA_DRAIN_S, its remaining lines (the answer's tokens, then its DONE) are
+        still coming - and without this, the NEXT request consumes them and is answered with the previous
+        request's text (measured 2026-10-26: three probe requests answered one conversation behind, one of them
+        with another client's words).  Bounded: a wedged engine cannot hold the next request for ever."""
+        if not getattr(self, "may_be_writing", False):
+            return
+        self.may_be_writing = False
+        print("[maya] skipping the lines of the request the engine was still writing ...", flush=True)
+        end = time.monotonic() + 180.0
+        while time.monotonic() < end:
+            try:
+                line = self.lines.get(timeout=2.0)
+            except queue.Empty:
+                continue
+            if line is None or line.startswith("ERR"):
+                return
+            if line.startswith("DONE"):
+                self._parse_done(line)
+                print("[maya] the skipped request's end reached; the stream is clean", flush=True)
+                return
+        print("[maya] the skipped request's end never arrived in 180 s; the stream may still be mixed", flush=True)
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        self._skip_stale_lines()
         if self.multi:
             yield from self._generate_multi(ids, max_new, sampling, cancel, embeddings)
             return
@@ -1091,6 +1119,7 @@ class StrataEngine:
                     print("[maya] " + line[5:].strip(), flush=True)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
+                    self.may_be_writing = False
                     done = True
                     return
                 elif line.startswith("ERR"):
@@ -1113,6 +1142,7 @@ class StrataEngine:
                     except queue.Empty:
                         print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
                               "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
+                        self.may_be_writing = True   # the next request must skip this one's lines first
                         break
                     if line is None or line.startswith("ERR"):
                         break
@@ -1245,6 +1275,7 @@ class StrataEngine:
                         print(f"[maya] request {rid}: stopped, and the engine did not say it had ended within "
                               f"{DRAIN_S:.0f} s (STRATA_DRAIN_S) - going on; the engine may still be writing it",
                               flush=True)
+                        self.may_be_writing = True   # the untagged tail could still reach the next request
                         break
                     if line is None or line.startswith("ERR "):
                         break

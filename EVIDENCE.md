@@ -42,7 +42,10 @@ guard decisions `~/gpu_monitor_guard.log`, per-request engine log
 | 13:49 | two interleaved clients, 27k conversations | **24/24 correct** — the checkpoint path exercised, the fix held | valid |
 | 13:59 | **the cancel-window probe** | "3/3 wrong" (empty answers, one-behind) | **INVALIDATED** — the server was shutting down mid-test and another client's tool-calling session was interleaving; recorded in `COORDINATION.md` §8 as a candidate, not a finding |
 | 14:06 | (the other agent) restarted the server | the engine now runs the ckpt-fix binary | valid |
-| 14:13 | **the cancel-window probe, the redo, exclusive box** | *this row is filled in below* | |
+| 14:13 | **the cancel-window probe, the redo, exclusive box** | **3/3 wrong — the defect reproduces deterministically**: B answered A's needle, C empty, D C's needle; the engine read two prompts at once and a client got its response before its read finished |
+| 14:22 | the engine restarted (the run's state was poisoned) | clean, `F:` 25.12 GiB |
+| 14:29 | **the fix live**: the drain-timeout marks the stream `may_be_writing`; the next request skips the stale lines to the skipped request's DONE before it consumes anything of its own | the same cancel probe: **3/3 correct**, and the server logged "the stream is clean" |
+| 14:39 | two interleaved clients, 27k conversations, on the fix | 6/6 correct | |
 
 ## What the day's evidence supports
 
@@ -58,6 +61,21 @@ guard decisions `~/gpu_monitor_guard.log`, per-request engine log
    the controlled redo is the 14:13 row.
 4. **The cancel-mid-prefill window** is the last unproven mechanism: the candidate for the
    12:38 bleed, invalidated at 13:59, redone at 14:13 on an exclusive box.
+
+## The cancel-window defect and its fix (the 14:13 → 14:29 pair)
+
+The 14:13 redo reproduced the defect deterministically (3/3 wrong, one conversation
+behind, one empty). The mechanism was in the **server**, not the engine: a client that
+vanishes mid-request makes the server STOP the engine and drain to the request's DONE —
+bounded at `STRATA_DRAIN_S` (60 s). When the drain gave up, the engine's *remaining* lines
+(the answer's tokens, then its DONE) were left in the shared, untagged queue — and the
+next request consumed them, so it was answered with the previous request's text.
+
+The fix (`serve/server.py`): the drain-timeout marks the stream `may_be_writing`, and the
+next request's first act is `_skip_stale_lines()` — consume-and-discard to the skipped
+request's DONE (bounded 180 s), then proceed with its own lines. Verified by the 14:29
+cancel probe (3/3 correct where 14:13 was 3/3 wrong) and the 14:39 interleaved-clients run
+(6/6).
 
 ## The redo row (14:13, exclusive box, ckpt-fix binary)
 
