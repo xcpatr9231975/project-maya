@@ -44,6 +44,65 @@ already bear on this — the admission gate (a request is not started when the d
 cannot hold it) and one engine at a time — but a *long-lived* engine that grows its slots
 moves its own floor, and that is what the next four items are about.
 
+## 0b. The defect that outranks everything: a shorter conversation inherits the previous one's tail
+
+Found 2026-10-26 ~12:38, while probing item A. Not a memory defect — a **correctness**
+defect, and it crosses clients.
+
+**The behaviour.** Each request is answered from the *previous* conversation's context —
+mechanically, one conversation behind:
+
+```
+P1 (needle word A): answered with the previous session's needle word
+P2 (needle word B): answered with A          ← P1's word
+P3 (needle word A): answered with B          ← P2's word
+```
+
+And when the previous conversation belonged to **another client**, the bleed crossed
+clients: one probe's answer was another agent's *prompt* ("can I ssh to 10.161.53.119
+using socks proxy 2249…") and a later one quoted its *reasoning* verbatim ("Let me check
+the IPFIX skill file…"). One client's conversation, served to another.
+
+**The mechanism.** The engine writes a new conversation's state from position 0, but on a
+unified-memory box the entries **beyond the new prompt's length** still belong to the
+previous conversation, and the model attends to them. So a conversation **shorter** than
+the previous one inherits its tail. Every observation of the day fits it:
+
+- the needle runs at 08:0x passed 5/5 — the prompts were *ascending* in length, so each
+  read overwrote the stale tail;
+- the probes after a 103k/239k conversation failed — 27,938-token prompts left a stale
+  tail, and the model answered the stale needle;
+- the swapped words between the two depths — each request inherited the other's needle
+  through the cache;
+- the restore paths are *not* the culprit: all three (snapshot, checkpoint, slot) verify
+  the restored tokens are a prefix of the new prompt (`std::equal` in `prep_prompt`,
+  `src/program/generate.cpp`). The leak is the device-side KV that the restore does not
+  truncate.
+
+**The reproduction**, self-contained:
+
+```bash
+python tools/reuse_probe.py --api-key sk-local --prime-tokens 100000
+# prime (a 100k conversation), then P1/P2/P3 -> the answers lag one conversation (exit 1)
+# on a fixed engine: all three correct, whatever the priming (exit 0)
+python tools/reuse_probe.py --api-key sk-local        # a clean engine: passes today
+```
+
+**The fix to explore** (engine, C++ — the cache invalidation, `src/core/glm_*`): on a
+context switch (a prompt that does not extend the live conversation) or a restore at
+position p, the device-side KV/DSA state **beyond the new prompt's length** must be
+invalidated, not left. The restore paths prove the tokens; the cache must be truncated to
+match.
+
+**Severity: critical** — a multi-client server where one client's conversation bleeds into
+another's answers is not a stability problem, it is a privacy and correctness failure.
+Until it is fixed, the 256k config is fit for a **single client at a time**, and an engine
+restart clears the state (a restart after any long conversation is the workaround).
+
+**Status:** reproduced twice (12:38 and the needle runs), the mechanism consistent with
+every observation of the day, the probe committed (`tools/reuse_probe.py`). The fix is not
+written.
+
 ## 1. Enhancement A — the session store's budget (config only, no rebuild)
 
 The engine already has the knobs (`src/program/generate.cpp:1417-1449`):

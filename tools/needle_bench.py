@@ -70,6 +70,12 @@ def haystack(n_chars: int) -> str:
     files = []
     for d, pat in SOURCES:
         files += sorted((ROOT / d).rglob(pat))
+    # the bench's own source names the needle sentence and the word list: a model that reads it can compose a
+    # word that looks exactly right (measured 2026-10-26: the answer was "meadow-copper-504", the depth-10 word's
+    # shape, from the depth-90 prompt whose needle was falcon-quartz-940).  Drop every file that carries the
+    # pattern, wherever it sits.
+    files = [f for f in files
+             if "secret code word" not in f.read_text(encoding="utf-8", errors="replace")]
     parts, total = [], 0
     while total < n_chars:
         for f in files:
@@ -130,12 +136,22 @@ def main() -> int:
             continue
         text = haystack(int(tokens * CHARS_PER_TOKEN))
         for d in (int(x) for x in a.depths.split(",")):
-            word = f"{rnd.choice(WORDS)}-{rnd.choice(WORDS)}-{rnd.randint(100, 999)}"
-            cut = int(len(text) * d / 100)
-            cut = text.rfind("\n", 0, cut) + 1 or cut          # at a line start
-            needle = f"\nThe secret code word for this text is: {word}. Remember it.\n"
-            prompt = (text[:cut] + needle + text[cut:] +
-                      "\n\nWhat is the secret code word mentioned in the text above? Reply with the code word only.")
+            # The word must appear EXACTLY ONCE in the prompt: the haystack is the repository's own text, and a
+            # document that mentions a needle word (measured 2026-10-26: this doc's own regression notes carried
+            # two of them) hands the model the answer.  Redraw until the insertion is the only occurrence.
+            for _ in range(8):
+                word = f"{rnd.choice(WORDS)}-{rnd.choice(WORDS)}-{rnd.randint(100, 999)}"
+                cut = int(len(text) * d / 100)
+                cut = text.rfind("\n", 0, cut) + 1 or cut      # at a line start
+                needle = f"\nThe secret code word for this text is: {word}. Remember it.\n"
+                prompt = (text[:cut] + needle + text[cut:] +
+                          "\n\nWhat is the secret code word mentioned in the text above? "
+                          "Reply with the code word only.")
+                if prompt.count(word) == 1:
+                    break
+            else:
+                print(f"{L:>5} depth {d:>3}%: skipped (every candidate word already appears in the haystack)")
+                continue
             try:
                 answer, n, secs = ask(a.url, a.api_key, prompt, a.timeout)
             except (OSError, urllib.error.HTTPError) as e:
