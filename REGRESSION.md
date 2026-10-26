@@ -162,6 +162,48 @@ Both headrooms are now pinned in the configs' `env` blocks
 `MAYA_*` to the `STRATA_*` names the engine reads and `serve/server.py` applies the
 config's env after `os.environ`, so the config always wins.
 
+## Admission control
+
+The parameters above are tuned for the prompts that were measured, and nothing stopped a
+*bigger* prompt from being admitted and running into the floor — where the memory guard
+kills the engine, or the driver refuses the allocation (`NV_ERR_NO_MEMORY`, whose error
+path deadlocks the box on this driver). The engine now checks the room before it starts
+a request:
+
+```
+room a request needs = the prompt path's borrow + the floor
+borrow = the engine's own number (the start-up line: "borrowing N MB of the expert pool")
+floor  = 3072 MiB, the memory guard's
+```
+
+If the device does not have that much free, the engine **waits** (a `NOTE waiting for
+room: ...` line every 10 s, so the server's stall check sees it working) and then
+**refuses** the request with `ERR out of memory: the device has N MiB free and this
+request needs M MiB ...`. The server maps that to a **503 with "the engine is up, try
+again"** — the engine lives, the request did not start, and nothing was killed.
+
+| knob | default | what it does |
+|---|---|---|
+| `STRATA_GLM_ADMIT` | on | `0` turns the check off |
+| `STRATA_GLM_ADMIT_FLOOR_MIB` | 3072 | the floor to keep (the guard's) |
+| `STRATA_GLM_ADMIT_WAIT_S` | 120 | how long to wait for room before refusing |
+| `STRATA_GLM_ADMIT_BORROW_MIB` | the engine's own | the borrow to assume |
+
+Verified live on the 262144 config (pool 65.2 GB, `F:` ~10.4 GiB):
+
+- **Ordinary traffic is admitted**: 10470 MiB free against 4417 + 3072 = 7489 MiB needed.
+- **A floor of 100000 MiB** (impossible): the request is refused, the client gets
+  `HTTP 503` with *"the device has 10145 MiB free and this request needs 104417 MiB …
+  the engine is up, try again"*, the engine stays up, and the guard logs nothing.
+- **A floor of 10200 MiB** (just above the free memory): the request waits 45 s with a
+  note every 10 s, then refuses the same way — the engine never goes silent, so the
+  server's stall check stays disarmed.
+
+With the tuned parameters (headroom 32, `--prefill 16384`) the margin is 3.0 GiB; at
+`--prefill auto` the borrow is 6775 MB and the same check would *refuse* a request that
+the measurements showed dipping 5.1 GiB under the floor — the case that killed the engine
+on 2026-10-25 20:42.
+
 ## Defects found (not driver-related)
 
 ### 0. The restart path: two engines on one device, and the driver refusing memory

@@ -138,12 +138,19 @@ appears (+12%).
    (`glm slots: saved a 115201-token conversation (1.61 GB); 4 kept, 3.18 GB`). Every
    restart re-enters the same tight budget whatever the headroom says. Cap what it
    restores, or prune old conversations before a restart.
-2. **Admission control -- the actual fix.** The engine already calls `cudaMemGetInfo`
+2. **Admission control -- the actual fix (implemented 2026-10-26).** The engine already calls `cudaMemGetInfo`
    in ~12 places (`src/program/generate.cpp`); checking
    `free >= borrow + floor` *before* admitting a prefill turns a guard kill into a
    queue, after which no headroom value can be wrong. The engine already refuses the
    expert pool at boot for exactly this reason ("no room for the expert pool: 0 slots
-   a layer, at least 8 needed") -- the same check at request time is what is missing.
+   a layer, at least 8 needed") -- the same check at request time is what was missing.
+   It is now there: before a request starts, the engine compares the device's free
+   memory with the prompt path's borrow plus the 3072 MiB floor, waits (a note every
+   10 s) and then refuses the request with `ERR out of memory: ...`, which the server
+   answers with a 503 ("the engine is up, try again"). The engine stays alive and
+   nothing is killed. Knobs: `STRATA_GLM_ADMIT` (off), `STRATA_GLM_ADMIT_FLOOR_MIB`,
+   `STRATA_GLM_ADMIT_WAIT_S`, `STRATA_GLM_ADMIT_BORROW_MIB`. See
+   [REGRESSION.md](../REGRESSION.md).
 
 ## 7. Validation status (honest)
 

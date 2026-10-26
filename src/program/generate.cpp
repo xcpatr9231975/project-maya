@@ -1057,6 +1057,66 @@ extern "C" void strata_on_sigterm(int) {
     }
 }
 
+// ADMISSION CONTROL: a request is not started when the device cannot hold it.  The memory guard kills an engine
+// whose device-free falls under its floor (3072 MiB), and the driver's own refusal (NV_ERR_NO_MEMORY) deadlocks the
+// box on this driver - so a request that would run into either is waited for and then refused, instead of started.
+// The room a request needs is the prompt path's borrow (the largest single thing a request claims) plus that
+// floor; the borrow is what the engine's own start-up line prints ("borrowing N MB of the expert pool").
+//
+//   STRATA_GLM_ADMIT=0            the check off (it is on by default)
+//   STRATA_GLM_ADMIT_FLOOR_MIB    the floor to keep (default 3072, the memory guard's)
+//   STRATA_GLM_ADMIT_WAIT_S       how long to wait for room before refusing (default 120)
+//   STRATA_GLM_ADMIT_BORROW_MIB   the borrow to assume (default: the engine's own)
+static bool admit_room(strata::core::Glm5Model& model, std::string& why) {
+    if (const char* off = std::getenv("STRATA_GLM_ADMIT")) {
+        if (std::atoi(off) == 0) return true;
+    }
+    int64_t floor_mib = 3072;
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_FLOOR_MIB")) floor_mib = std::max<int64_t>(0, std::atoll(v));
+    double wait_s = 120.0;
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_WAIT_S")) wait_s = std::max(0.0, std::atof(v));
+    int64_t borrow_mib = (int64_t) (model.prefill_borrow_bytes() >> 20);
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_BORROW_MIB")) borrow_mib = std::max<int64_t>(0, std::atoll(v));
+    const int64_t need_mib = borrow_mib + floor_mib;
+    int dev = 0;
+    if (model.fast() && !model.pool_vram().empty()) dev = model.pool_vram()[0].dev;
+    const auto free_mib = [&] {
+        int cur = 0;
+        cudaGetDevice(&cur);
+        cudaSetDevice(dev);
+        size_t fb = 0, tb = 0;
+        const bool ok = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        cudaSetDevice(cur);
+        return ok ? (int64_t) (fb >> 20) : -1;    // -1: cannot tell (admit: the driver will say)
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    double noted = 0;
+    for (;;) {
+        const int64_t free = free_mib();
+        if (free < 0) return true;
+        if (free >= need_mib) return true;
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (waited >= wait_s) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf,
+                          "out of memory: the device has %lld MiB free and this request needs %lld MiB "
+                          "(the prompt path's borrow %lld MiB + the %lld MiB floor); the request was not started",
+                          (long long) free, (long long) need_mib, (long long) borrow_mib, (long long) floor_mib);
+            why = buf;
+            return false;
+        }
+        if (waited - noted >= 10.0) {     // a line every 10 s: the server's stall check sees the engine working
+            noted = waited;
+            std::printf("NOTE waiting for room: %lld MiB free, %lld MiB needed (the borrow %lld MiB + the %lld MiB "
+                        "floor)\n",
+                        (long long) free, (long long) need_mib, (long long) borrow_mib, (long long) floor_mib);
+            std::fflush(stdout);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -2866,6 +2926,14 @@ static int glm_pack_generate(const Options& o) {
             return;
         }
         if (!deferred_pauses.empty()) flush_pauses();   // (a PAUSE in the last read's gaps: its state, kept first)
+        {   // admission control: a request is queued only when the device can hold it
+            std::string why;
+            if (!admit_room(model, why)) {
+                std::printf("ERR %d %s\n", rid, why.c_str());
+                std::fflush(stdout);
+                return;
+            }
+        }
         auto g = std::make_unique<Gen>();
         g->rid = rid;
         g->sp = rq;
@@ -4289,6 +4357,15 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             model.set_image_rows(cur_img_pos, cur_img_rows);
+            {   // admission control: the request starts only when the device can hold it
+                std::string why;
+                if (!admit_room(model, why)) {
+                    std::printf("ERR %s\n", why.c_str());
+                    std::fflush(stdout);
+                    model.set_image_rows({}, {});
+                    continue;
+                }
+            }
             run_request(toks, max_new, rq);
             model.set_image_rows({}, {});
             continue;
