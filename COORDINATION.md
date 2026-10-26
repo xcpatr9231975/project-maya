@@ -172,4 +172,15 @@ pairing and the read pipeline desynchronise when a long request is followed by s
 — the fix spans the read pipeline and the response routing, not only the cache
 invalidation. The engine was restarted at 14:22 (its state was poisoned by the run).
 
+**FIXED 14:29 — the mechanism was the server's, not the engine's.** A client that vanishes
+mid-request makes the server STOP the engine and drain to the request's DONE, bounded at
+`STRATA_DRAIN_S` (60 s); when the drain gave up, the engine's remaining lines sat in the
+shared untagged queue and the NEXT request consumed them — hence "answered one conversation
+behind". The fix is server-side (`serve/server.py`): the drain-timeout marks the stream
+`may_be_writing`, and the next request skips the stale lines to the skipped request's DONE
+before consuming its own. Verified: the same cancel probe **3/3 correct** (was 3/3 wrong),
+two interleaved clients **6/6**. The engine-side part stays open: that window also showed
+two prompts being READ at once — the lines no longer reach the wrong client, but why two
+reads run concurrently is still to explain (ENHANCEMENT.md 0b).
+
 The redo is `tools/cancel_probe.py` — **on an exclusive box only**
