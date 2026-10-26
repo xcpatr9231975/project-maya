@@ -99,9 +99,15 @@ another's answers is not a stability problem, it is a privacy and correctness fa
 Until it is fixed, the 256k config is fit for a **single client at a time**, and an engine
 restart clears the state (a restart after any long conversation is the workaround).
 
-**Status:** reproduced twice (12:38 and the needle runs), the mechanism consistent with
-every observation of the day, the probe committed (`tools/reuse_probe.py`). The fix is not
-written.
+**Status: reproduced deterministically** (EVIDENCE.md, the 14:13 redo on an exclusive
+box, the ckpt-fix binary): 3/3 wrong, every answer the previous request's needle, one
+empty. Two new facts from that run's engine log widen the class beyond the checkpoint
+maps: the engine was reading **two prompts at once** (a 2k request's progress lines
+interleaved with a 82k request's chunk lines), and a client received its response
+**before its read finished**. The request→response pairing and the read pipeline
+desynchronise when a long request is followed by short ones — the fix spans the read
+pipeline and the response routing, not only the cache invalidation. `ckpt_restore`'s
+missing `kv_stream_reset_maps()` (`0f1f10b`) stands as necessary; it is not sufficient.
 
 ## 1. Enhancement A — the session store's budget (config only, no rebuild)
 

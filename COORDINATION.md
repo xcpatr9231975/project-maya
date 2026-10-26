@@ -164,15 +164,12 @@ server was shutting down mid-test ("the engine did not end within 50 s: stopped"
 another client's tool-calling session was interleaving. The engine running now carries the
 ckpt fix (it started after the 13:27 build).
 
-The redo is `tools/cancel_probe.py` — **on an exclusive box only** (no other client, no
-shutdown). The interleaved-clients test meanwhile is CLEAN: 24/24 correct, two clients
-alternating 27k-token conversations through the checkpoint path, on the fixed binary
-(`tools/reuse_probe.py` covers the single-client case, primed and unprimed).
+**DONE — 14:13, exclusive box, the ckpt-fix binary: 3/3 wrong, deterministically.**
+Every answer was the previous request's needle; one was empty. And the engine log shows
+the class is wider: B's 2k read ran interleaved with A's 82k chunk lines (two prompts read
+at once), and A's client got its response before its read finished. The request→response
+pairing and the read pipeline desynchronise when a long request is followed by short ones
+— the fix spans the read pipeline and the response routing, not only the cache
+invalidation. The engine was restarted at 14:22 (its state was poisoned by the run).
 
-The candidate defect the redo chases: the cancelled prefill keeps running past the
-server's 60 s drain (the prefill honours the cancel at chunk boundaries; the chunks are
-~25 s), and requests arriving inside that window were finished instantly with 0 tokens
-(`finish=length`) - the empty answers in the invalid run. The engine-side question: what
-makes a request finish with 0 tokens and finish=length while the prompt was read?
-
-Two smaller notes:
+The redo is `tools/cancel_probe.py` — **on an exclusive box only**
