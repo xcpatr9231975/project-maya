@@ -156,35 +156,23 @@ the cache the restore paths share — announce and take it, or hand it to me and
 Until it is fixed, the honest operating rule for the 256k config is: single client at a
 time, and restart the engine after any long conversation.
 
-Two smaller notes: (1) my `MAYA_GLM_SLOTS=1` is NOT the cause — the bleed reproduces with
-the slot mechanism exonerated; but until the fix, a *higher* slot count does not help
-either. (2) `tools/needle_bench.py` had two bench bugs of mine, both fixed: the haystack
-included the bench's own source (the model could compose a needle-format word from the
-WORD list), and it now verifies the needle appears exactly once in the prompt. **take #1's policy (below) and please implement
-  it** — you own `generate.cpp` right now, announce-style. **#3 (the bench-path stall)** I
-  will take *after* you are out of `generate.cpp` — announce first per §5, since the
-  heartbeat belongs in the serve loop. #4 (the 115k prompt at headroom 40) I can run when
-  the box is mine; say the word. **Holding all pushes** per §6 until the user says go.
+### The cancel-mid-prefill window — the reproduction attempt at 14:0x was INVALID, the redo is pending
 
-**Item #1 policy, for your implementation** (the numbers are in `ENHANCEMENT.md` §3):
-cap the slots in **tokens AND bytes, LRU** — `STRATA_GLM_SLOT_BUDGET_GB` (default **4**)
-and `STRATA_GLM_SLOT_TOKENS` (default **262144**); a conversation bigger than the budget
-is not kept at all (it re-reads its prompt); the same caps bound the restore-at-start
-path. The measured bytes/token of slot state: 13.3 (239.5k), 14 (115.2k), 19.5 (94.9k) —
-use 20 B/token as the safe figure. The binding constraint is the gate's *fixed* demand
-(borrow 4417 + floor 3072 = 7489 MiB): the slots must keep device_free ≥ 7489 + 2048.
-Acceptance: after N conversations of any size, `N kept, X GB` has X ≤ 4 GB and `F:` never
-drops under 7489 + 2048 while serving.
+The 14:0x run of the cancel window (a client aborts a 90k prefill at 25 s, then three
+requests arrive during the unwind) came back 3/3 wrong — but it is **not evidence**: the
+server was shutting down mid-test ("the engine did not end within 50 s: stopped") and
+another client's tool-calling session was interleaving. The engine running now carries the
+ckpt fix (it started after the 13:27 build).
 
----
+The redo is `tools/cancel_probe.py` — **on an exclusive box only** (no other client, no
+shutdown). The interleaved-clients test meanwhile is CLEAN: 24/24 correct, two clients
+alternating 27k-token conversations through the checkpoint path, on the fixed binary
+(`tools/reuse_probe.py` covers the single-client case, primed and unprimed).
 
-### Quick reference
+The candidate defect the redo chases: the cancelled prefill keeps running past the
+server's 60 s drain (the prefill honours the cancel at chunk boundaries; the chunks are
+~25 s), and requests arriving inside that window were finished instantly with 0 tokens
+(`finish=length`) - the empty answers in the invalid run. The engine-side question: what
+makes a request finish with 0 tokens and finish=length while the prompt was read?
 
-- Gate demand on this box: `borrow 4417 + floor 3072 = 7489 MiB`
-- Pool sizing: `MemAvailable − headroom − 1 GB` (`glm_fast_path.cu:1533`)
-- The engine's borrow is printed at boot: `borrowing N MB of the expert pool`
-- Monitor log `~/gpu_monitor_log.txt` (`F:` = device-free, the honest number; `A:` lies),
-  guard log `~/gpu_monitor_guard.log`, stall snapshots `~/gpu_reports/stall_*.txt`
-- Method: `.opencode/skills/dgx-spark-memory-forensics/SKILL.md`
-- **0-byte `gpu_report_*.txt` = the freeze instant.** There have been none since the
-  580.178.04 boot at 19:09 on 10-25; all 17 on disk predate it.
+Two smaller notes:
