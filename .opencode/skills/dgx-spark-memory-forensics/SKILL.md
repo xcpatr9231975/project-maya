@@ -30,6 +30,15 @@ Where to look: `~/gpu_monitor_log.txt` (samples), `~/gpu_monitor_guard.log`
 (WARN / armed / kill decisions), `~/.gpu_monitor_guard_state` (current guard
 state), `~/gpu_reports/` (per-sample reports, 7-day retention).
 
+After a hard lock the engine's own log has lost its unflushed stdio buffer as
+NUL padding, so also read `~/gpu_engine_tail.txt` — the monitor keeps a rolling
+copy of the engine's last 40 lines on every sample — and any
+`~/gpu_reports/stall_*.txt` (a stall snapshot: why, GPU/device-free readings,
+`/proc/<pid>/status`, the engine's tail) the stall guard wrote before it
+SIGTERMed the engine. A `stall:` tag in the sample line means the engine went
+silent while the GPU stayed pegged with memory still healthy — the 2026-10-24
+and 2026-10-25 hard-lock signature, which no memory floor ever saw.
+
 ## Trend analysis: step vs leak
 
 Bucket `F:` from the sample log into 30-min min/max:

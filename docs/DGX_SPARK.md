@@ -291,10 +291,10 @@ the size): with four running, the VRAM hit was 99.8% and a token saw 0.67 disk r
 ## Memory safety (the watchdogs this box runs)
 
 On a GB10 the device allocates from the same RAM the CPU uses, and when that pool runs out the driver returns
-`NV_ERR_NO_MEMORY` on an error path that deadlocks: the box hard-locks, nothing reaches the console, and with the
-kernel watchdog disabled ("NMI not fully supported") only a power-cycle recovers it. No OOM killer comes first,
-because the driver does not charge its pages to a cgroup - the engine holds ~90 GB while its cgroup reports ~4 GB.
-So the repo ships its own, and they are ordered so a build freezes before the guard kills:
+`NV_ERR_NO_MEMORY` on an error path that deadlocks: the box hard-locks, nothing reaches the console, and the
+kernel's hard-lock detector is disabled ("NMI not fully supported"). No OOM killer comes first, because the
+driver does not charge its pages to a cgroup - the engine holds ~90 GB while its cgroup reports ~4 GB.
+So the repo ships its own guards, their pre-lock ordering, and a recovery layer for the lock itself:
 
 - **`safe-build.sh`** (repo root) wraps a build or any command: pre-flight refusal, its own session/process group
   (one signal reaches every compiler), and a 5 s watchdog that SIGSTOPs the whole group when MemAvailable, swap,
@@ -311,6 +311,15 @@ So the repo ships its own, and they are ordered so a build freezes before the gu
   ([docs/2026-10-25-guard-concurrency.md](2026-10-25-guard-concurrency.md)), and the journal watch is a technique
   credited to MiaAI Lab's memwatch.sh in [NOTICE](../NOTICE) (AGPL-3.0-or-later, reimplemented from scratch).
   Its state lives in `~/.gpu_monitor_guard_*` files; redeploying the script needs no restart, the timer re-runs it.
+- **`tools/hardlock-watchdog.sh`** is the recovery layer, not another guard: the board's `/dev/watchdog0` is the SoC's
+  SBSA Generic Watchdog, which runs in two-stage mode (WS0 panics, WS1 drives a real hardware reset one timeout
+  later). `RuntimeWatchdogSec` has systemd ping it every few seconds; when the box hard-locks and PID 1 stops
+  pinging, the timer fires even though the kernel cannot run the panic path. `kernel.panic=15` makes the panic
+  stage reboot too. `sudo tools/hardlock-watchdog.sh apply` arms it (`status` is read-only and root-free) and turns
+  the manual power-cycle into an automatic reboot, worst case ~2x the timeout. It cannot prevent the lock - the
+  floors and the stall guard still do that - but it ends the "drive to the machine" part. The 2026-10-25 17:49
+  lock also showed the stall guard's blind spot: the engine was still emitting tokens one sample before the box
+  died, so a 90 s silence gate never had runway.
 - The tests for the guard's baseline identity and journal cursor run in CI:
   `python -m unittest tools.test_gpu_monitor_baseline tools.test_gpu_monitor_nvrm`.
 

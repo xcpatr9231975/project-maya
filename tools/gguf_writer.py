@@ -31,7 +31,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
 # ggml_type ids we can write. Values match GGML_TYPES in gguf_reader.py.
-TYPE_IDS = {"F32": 0, "F16": 1, "Q2_0": 42}
+TYPE_IDS = {"F32": 0, "F16": 1, "Q2_0": 42, "I32": 26}
 DEFAULT_ALIGNMENT = 32
 
 _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
@@ -107,6 +107,13 @@ class GGUFWriter:
     def add_f32(self, name: str, arr: np.ndarray) -> None:
         a = np.ascontiguousarray(arr, dtype="<f4")
         self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
+
+    def add_i32(self, name: str, arr: np.ndarray) -> None:
+        """A 1-D int32 tensor. The corpus store's token stream and its suffix array are these."""
+        a = np.ascontiguousarray(arr, dtype="<i4")
+        if a.ndim != 1:
+            raise ValueError(f"{name}: add_i32 takes a 1-D array, got shape {a.shape}")
+        self.tensors.append(_Tensor(name, list(a.shape), "I32", a.tobytes()))
 
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
         """`arr` is (rows, in_features) row-major with every row `shape[0]` long; `shape` is the FULL

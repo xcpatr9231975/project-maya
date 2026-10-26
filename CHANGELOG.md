@@ -67,6 +67,48 @@ device shares with the system, and the CPU lane falls back to ggml's NEON kernel
   again) and 400 for a request that was wrong. `STRATA_PREALLOC_FAIL=<tokens>` and `STRATA_MMQ_POOL_FAIL=<n>` make
   the two failures happen on purpose; `tools/test_alloc_recovery.py` runs them and checks that the engine answers
   the next request (@xcpatr9231975).
+- **The prompt-lookup drafter counts its evidence** (`include/strata/spec/suffix_drafter.hpp`): among the matches
+  of the longest length, every occurrence votes for the continuation that followed it and the most-voted one is
+  proposed, so a continuation seen twice no longer loses to a more recent one seen once; `last_support()` reports
+  how many occurrences voted. The longest match still decides which candidates vote, and the fire rate and the
+  accepted tokens per window are unchanged on a 710k-token corpus (95% of steps propose, 1.72 against 1.73 tokens
+  accepted per proposal). It ports the counting half of TandemLLM's ngram drafter (AGPL-3.0), reimplemented from
+  scratch; the credit is in [NOTICE](NOTICE).
+- **...and the drafter's policy prices it** (`include/strata/spec/draft_policy.hpp`): a proposal's support moves it
+  up the match ladder for its starting rate - one vote starts at its own bucket's rate, two at one bucket up, three
+  or more at two - and each (bucket, support) pair keeps its own decayed counts. Measured on the drafter's own
+  simulation (`suffix_drafter_test --simulate`, which now reports acceptance by bucket and support): a 3-5-token
+  match with three votes accepts like a 12-23-token one, and a 24-token match accepts the same whatever its
+  support. In the same simulation with a modelled MTP and the measured window costs, the policy takes 41% more
+  lookup windows on fresh text and 34% more on copies, at equal or better tokens per millisecond in both.
+- **The corpus store, the drafter's second vote source** (`--corpus PATH`,
+  `tools/build_corpus.py`, `include/strata/ngram/corpus_store.hpp`): a suffix array over a token corpus, built
+  once from text with the model's own tokenizer and mapped read-only, answers "has this n-gram EVER occurred"
+  where the per-sequence index answers only "since this request started". A lookup is two binary searches
+  (0.4 us measured on a 710k-token store), it is asked only for matches of at least 7 tokens, and its votes
+  count half a local occurrence's. Measured on the drafter's simulation over a 710k-token corpus: on text the
+  corpus has seen, 2.48 -> 6.04 tokens per step (copy regime 3.48 -> 5.63); on a corpus disjoint from the text,
+  2.48 -> 2.67 and 3.48 -> 4.02, because the longer matches it finds are the more reliable ones. It is the
+  counting-and-corpus half of TandemLLM's ngram drafter (AGPL-3.0), reimplemented from scratch; the credit is
+  in [NOTICE](NOTICE). `suffix_drafter_test --simulate` and `tools/test_build_corpus.py` cover both sides.
+- **...and the votes build a tree** (`include/strata/spec/suffix_drafter.hpp`): the voted continuations form a
+  prefix trie whose node scores are the probability a whole path is accepted, the parent's score times the
+  node's vote mass over the parent's mass plus a smoothing that applies at EVERY level - which is what stops a
+  continuation seen once from claiming a sixteen-token draft. `propose` descends the tree by score, so the
+  choice is made per level (three votes for a first token beat two for a whole continuation) rather than once
+  over the whole continuation, and `last_expected()` reports the expected tokens the chain commits. Measured on
+  the drafter's simulation, with no corpus and no policy: 2.63 -> 2.71 tokens per step on fresh text and
+  3.48 -> 3.63 on copies, the fire rate unchanged, with the gain where the per-level choice matters (a short
+  match seen once: 1.22 -> 1.31 accepted per proposal). Verifying the tree itself rather than its best chain
+  still needs a tree mask in the verify window and a recurrent state per branch - see the note in
+  `src/core/verify.cpp`.
+- **...and the policy prices each proposal by its own profile** (`include/strata/spec/draft_policy.hpp`): the
+  drafter hands `choose` the chain's per-level scores, so the expected tokens of a window of k drafts is one plus
+  the first k levels instead of one pooled rate's geometric series. Two proposals with the same match length, the
+  same support and the same first-token probability are now priced by their tails - a deep chain asks for a long
+  window, a thin one for the shortest - where the pooled rate asked for the same middle window for both. In the
+  policy simulation (measured window costs, a modelled MTP) the policy takes 2.7x more lookup windows on fresh
+  text and 2.5x more on copies, at 60.1 -> 60.4 and 60.4 -> 60.6 tokens per millisecond.
 
 ## v1.1.27 - 2026-10-24
 

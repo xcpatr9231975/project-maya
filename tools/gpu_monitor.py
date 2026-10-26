@@ -20,6 +20,14 @@ One invocation = one sample:
  *   MiaAI Lab's memwatch.sh (AGPL-3.0-or-later,
  *   github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark);
  *   reimplemented from scratch, no code taken.
+ * stall guard: the engine's own log silent for STALL_QUIET_S while the GPU
+ *   is pegged (>= STALL_UTIL_PCT) means the engine stopped making progress
+ *   with memory still healthy -- the signature the box hard-locked from on
+ *   2026-10-24/25, which no memory floor ever saw.  Snapshots the engine's
+ *   tail, SIGTERMs the engine, escalates to SIGKILL after STALL_GRACE_S, and
+ *   keeps a rolling copy of the engine tail in ~/gpu_engine_tail.txt (a hard
+ *   lock loses the engine log's unflushed buffer as NUL padding).
+ *   GPU_MONITOR_STALL_GUARD=0 disarms it.
     (2026-09-20 fix: old build wrote an unbounded report every run -> 1.45 M
     files / 5.7 GB; also old regexes matched the May nvidia-smi layout and
     logged only N/A ever since)
@@ -166,6 +174,45 @@ GUARD_LOG_PATH        = os.path.join(HOME, "gpu_monitor_guard.log")
 # timestamp so the one-shot process can count only NEW kernel-log lines.
 NVRM_PATH             = os.path.join(HOME, ".gpu_monitor_guard_nvrm")
 NVRM_JOURNAL_TIMEOUT  = 10
+
+# --- stall / liveness guard (2026-10-25) -------------------------------------
+# The guard above answers "is the box about to run out of device memory".
+# It cannot see the failure the box has actually hard-locked from three
+# times (2026-10-24 19:40, 2026-10-24 21:08, 2026-10-25 17:11): the engine
+# stops making progress while the GPU stays pegged at 94-95%, with
+# device-free still healthy (7-15 GiB), the driver refusing nothing, and the
+# kernel log silent to the last line.  On GB10 device memory IS system RAM
+# and the kernel watchdog is disabled, so a GPU-side fault takes the whole
+# box with it and no userspace watchdog can save it -- but a hang that is
+# still only the ENGINE (host-side deadlock, stuck copy lane) is
+# recoverable, and in both cases the evidence worth having is the engine's
+# own last output, which dies with the box.
+#
+# So: watch the file the engine actually writes to (its own stderr fd --
+# /proc/<engine>/fd/2, the same inode the "[maya] ..." progress lines land
+# in; fd 1 is a pipe to the server and is skipped).  When that file has been
+# silent for STALL_QUIET_S while the GPU is at STALL_UTIL_PCT or more, treat
+# it as a stall: snapshot the engine's tail, SIGTERM the engine, escalate to
+# SIGKILL after STALL_GRACE_S.  The launcher restarts the engine on the next
+# request, so a false positive costs one restart -- and the threshold sits
+# well above the longest legitimate silent stretch there is (one
+# 32768-token prefill chunk, ~46 s, with the chunk stage line silenced;
+# normally the launcher prints a progress line every 10 s).
+#
+# An idle engine is silent by design, which is why the utilization gate and
+# not the silence alone is what arms this.  A rolling copy of the engine's
+# tail is kept on every sample regardless (gpu_engine_tail.txt): after a
+# hard lock it is the only record left of what the model was doing, since
+# the engine's own log loses its unflushed buffer as NUL padding.
+STALL_ENABLED      = _env_bool("GPU_MONITOR_STALL_GUARD", "1")
+STALL_UTIL_PCT     = _env_float("GPU_MONITOR_STALL_UTIL_PCT", "90", exclusive=True)
+STALL_QUIET_S      = _env_float("GPU_MONITOR_STALL_QUIET_S", "90", exclusive=True)
+STALL_GRACE_S      = _env_float("GPU_MONITOR_STALL_GRACE_S", "30", exclusive=True)
+STALL_TAIL_LINES   = int(_env_float("GPU_MONITOR_STALL_TAIL_LINES", "40"))
+STALL_LOG_PATH     = os.environ.get("GPU_MONITOR_STALL_LOG", "").strip()
+STALL_STATE_PATH   = os.path.join(HOME, ".gpu_monitor_stall_state")
+STALL_TAIL_PATH    = os.path.join(HOME, "gpu_engine_tail.txt")
+STALL_SNAP_DIR     = REPORT_DIR          # stall_*.txt; pruned by nothing
 
 if MIN_CONFIRM_AGE_S > GUARD_CONSEC_S:
     raise ValueError("GPU_MONITOR_MIN_CONFIRM_AGE_S must not exceed GPU_MONITOR_GUARD_CONSEC_S")
@@ -963,6 +1010,221 @@ def memory_guard(mem, dfree, procs, psi_f=None, nvrm=None):
     return "guard:armed"
 
 
+def _engine_log_file(pid):
+    """The regular file this process writes its log to, or None.
+
+    The engine's stderr is the file it and its launcher both append to:
+    /proc/<engine>/fd/2 resolves to maya-maya-s-v2-iq2_xxs-256k.log, the
+    same inode the "[maya] ..." progress lines land in, while fd 1 is a pipe
+    to the server and fd 0 is /dev/null.  When several regular files are
+    open, the most recently written *.log wins, so a wrapper's own capture
+    is not mistaken for the engine's stream.  A pipe, socket or deleted
+    target yields None -- the stall guard then stays out of the way rather
+    than guessing.
+    """
+    best = None
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if not target.startswith("/"):
+            continue
+        try:
+            if not os.path.isfile(target):
+                continue
+            mtime = os.stat(target).st_mtime_ns
+        except OSError:
+            continue
+        score = (target.endswith(".log"), mtime)
+        if best is None or score > best[0]:
+            best = (score, target)
+    return best[1] if best else None
+
+
+def _log_tail(path, lines):
+    """The last `lines` non-empty lines of a file, NUL padding removed.
+
+    A hard lock costs the engine its unflushed stdio buffer, and the kernel
+    leaves the lost region as NULs inside the file (a 1806-byte run was
+    measured at the 2026-10-25 lock), so reading the tail raw can return
+    mostly zeros.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > 262144:
+                f.seek(size - 262144)
+            else:
+                f.seek(0)
+            data = f.read()
+    except OSError:
+        return []
+    out = []
+    for raw in data.replace(b"\x00", b"").decode("utf-8", "replace").split("\n"):
+        if raw.strip():
+            out.append(raw)
+    return out[-lines:] if lines > 0 else out
+
+
+def _stall_snapshot(pid, path, util, temp, dfree, mem, why):
+    """Write ~/gpu_reports/stall_<ts>.txt and return its path (or None)."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rp = os.path.join(STALL_SNAP_DIR, f"stall_{stamp}.txt")
+    bar = "=" * 64
+    avail = mem.get("MemAvailable") if mem else None
+    try:
+        with open(rp, "w") as f:
+            f.write(f"{bar}\nDGX Spark engine stall -- "
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{bar}\n")
+            f.write(f"{'why':<18}{why}\n")
+            f.write(f"{'engine pid':<18}{pid}\n")
+            f.write(f"{'engine log':<18}{path}\n")
+            f.write(f"{'utilization':<18}{fmt(util, '%'):>16}\n")
+            f.write(f"{'temperature':<18}{fmt(temp, '\N{DEGREE SIGN}C'):>16}\n")
+            f.write(f"{'device free':<18}"
+                    f"{('N/A' if dfree is None else f'{dfree}MiB'):>16}\n")
+            f.write(f"{'mem available':<18}{kib(avail):>16}\n")
+            f.write("-" * 30 + "\n")
+            try:
+                with open(f"/proc/{pid}/status") as pf:
+                    for key in ("Name", "State", "VmRSS", "Threads"):
+                        m = re.search(rf"^{key}:\s*(.+)$", pf.read(), re.M)
+                        if m:
+                            f.write(f"{key:<18}{m.group(1):>16}\n")
+            except OSError:
+                f.write("(no /proc status: the process is gone)\n")
+            f.write("-" * 30 + f"\nlast {STALL_TAIL_LINES} engine log lines:\n")
+            for line in _log_tail(path, STALL_TAIL_LINES):
+                f.write(f"  {line}\n")
+            f.write(f"{bar}\n")
+    except OSError:
+        return None
+    return rp
+
+
+def _stall_state():
+    try:
+        with open(STALL_STATE_PATH) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _set_stall_state(s):
+    _atomic_write(STALL_STATE_PATH, s)
+
+
+def _roll_engine_tail(path):
+    """Keep a rolling copy of the engine's tail for post-mortem forensics."""
+    if not path:
+        return
+    lines = _log_tail(path, STALL_TAIL_LINES)
+    if not lines:
+        return
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = f"# engine log tail ({path}) as of {stamp}\n" + "\n".join(lines) + "\n"
+    try:
+        _atomic_write(STALL_TAIL_PATH, body)
+    except OSError:
+        pass
+
+
+def stall_guard(util, temp, procs, dfree, mem):
+    """Kill an engine that stopped making progress while the GPU is pegged.
+
+    Returns a short tag for the sample line, or None.  Separate state file
+    from the memory guard, so the two never fight over one another's armed
+    states; a stall kill also clears a stale memory-guard arm so it cannot
+    immediately frame someone else for the engine's silence.
+    """
+    if not STALL_ENABLED:
+        return None
+    now = time.time()
+    state = _stall_state().split(":")
+
+    if state[0] == "stall-termed":
+        try:
+            pid, expected, termed_at = state[1], int(state[2]), float(state[3])
+            valid = pid.isdigit() and int(pid) > 0 and expected >= 0 and termed_at >= 0
+        except (IndexError, ValueError):
+            valid = False
+        if not valid:
+            guard_log("discarding malformed stall state")
+            _set_stall_state("")
+            return None
+        if _starttime(int(pid)) != expected:
+            _set_stall_state("")          # the engine restarted on its own
+            return None
+        if not _alive(pid):
+            guard_log(f"pid {pid} exited after the stall SIGTERM")
+            _set_stall_state("")
+            return None
+        if now - termed_at >= STALL_GRACE_S:
+            if _signal_pid(pid, signal.SIGKILL, expected):
+                guard_log(f"pid {pid} still alive {STALL_GRACE_S:.0f}s after "
+                          "the stall SIGTERM -> SIGKILL")
+            else:
+                guard_log(f"pid {pid} was not SIGKILLed after the stall "
+                          "SIGTERM: process identity changed or pidfd "
+                          "signaling is unavailable")
+            _set_stall_state("")
+            return "stall:killed"
+        return "stall:draining"
+
+    # Not mid-kill: find what to watch.  The top GPU consumer is the engine,
+    # and its own stderr fd is the file it and its launcher append to.
+    if not procs:
+        return None
+    pid, mib, name = max(procs, key=lambda p: p[1])
+    path = STALL_LOG_PATH or _engine_log_file(int(pid))
+    if path:
+        # Kept on every sample, stall or not: after a hard lock it is the
+        # only record of what the engine was doing.
+        _roll_engine_tail(path)
+
+    # An idle engine is silent by design -- this is the false-positive gate.
+    if util is None or util < STALL_UTIL_PCT:
+        if state[0]:
+            _set_stall_state("")
+        return None
+    if _state().startswith("termed:"):
+        return None                          # the memory guard is killing it
+    if not path:
+        return None                          # nothing watchable (pipe, gone)
+    try:
+        quiet = now - os.stat(path).st_mtime
+    except OSError:
+        return None
+    if quiet < STALL_QUIET_S:
+        if state[0]:
+            _set_stall_state("")
+        return None
+
+    starttime = _starttime(int(pid))
+    if starttime is None:
+        return None
+    why = (f"engine log silent {quiet:.0f}s (>= {STALL_QUIET_S:.0f}s) at "
+           f"{util:.0f}% GPU, device_free "
+           f"{'N/A' if dfree is None else str(dfree) + 'MiB'}")
+    rp = _stall_snapshot(pid, path, util, temp, dfree, mem, why)
+    guard_log(f"STALL {name}(pid {pid}): {why} -> SIGTERM"
+              + (f"; snapshot {rp}" if rp else ""))
+    if _signal_pid(pid, signal.SIGTERM, starttime):
+        _set_stall_state(f"stall-termed:{pid}:{starttime}:{now}")
+        armed = _state()
+        if armed == "" or armed.startswith("armed:"):
+            _set_state("")                   # do not let a stale arm frame another
+        return "stall:terming"
+    _set_stall_state("")
+    return "stall:term-failed"
+
+
 def main():
     # Whole-run exclusive lock (2026-10-25): if another invocation is
     # mid-sample, it owns this instant -- skip everything (no sample line,
@@ -990,6 +1252,7 @@ def _main_locked():
     dfree, dtotal = device_free()
     nvrm_new  = nvrm_errors()
     guard     = memory_guard(mem, dfree, procs, psi_f, nvrm_new)
+    stall     = stall_guard(util, temp, procs, dfree, mem)
     # Rebase the RSS baseline only on a healthy sample: mid-breach the
     # pre-breach snapshot is what makes growth attribution work on the
     # confirming sample, so it must survive.
@@ -1015,6 +1278,8 @@ def _main_locked():
             f"N:{nvrm_s} | proc: {plist}")
     if guard:
         line += f" | {guard}"
+    if stall:
+        line += f" | {stall}"
     line += "\n"
 
     with open(LOG_PATH, "a") as f:
@@ -1044,6 +1309,8 @@ def _main_locked():
             f.write("(no GPU compute processes)\n")
         if guard:
             f.write(f"{'GUARD':<14}{guard:>16}\n")
+        if stall:
+            f.write(f"{'STALL':<14}{stall:>16}\n")
         f.write(f"{bar}\n")
     print(f"report: {rp}")
 

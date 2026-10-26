@@ -28,9 +28,15 @@ int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
 }
 
-double DraftPolicy::lookup_rate(int match) const {
-    const int b = bucket(match);
-    return (ok_[b] + kPriorN * kPriorQ[b]) / (ok_[b] + bad_[b] + kPriorN);
+int DraftPolicy::support_class(int support) {
+    return support <= 1 ? 0 : support == 2 ? 1 : 2;
+}
+
+double DraftPolicy::lookup_rate(int match, int support) const {
+    const int b = bucket(match), s = support_class(support);
+    const size_t i = (size_t) b * kSup + s;
+    const double prior = kPriorQ[std::min(kBuckets - 1, b + s)];   // support starts a proposal up the ladder
+    return (ok_[i] + kPriorN * prior) / (ok_[i] + bad_[i] + kPriorN);
 }
 
 double DraftPolicy::cost_ms(int t) const {
@@ -52,19 +58,33 @@ double DraftPolicy::mtp_tokens(int t) const {
     return 1.0 + 0.7 * (t - 1);       // before any MTP window of this size: a typical acceptance
 }
 
-DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match, int support, const double* levels,
+                                     int n_levels) const {
     Pick p;
     p.t = std::clamp(t_mtp, 1, max_t_);
     if (lookup_k <= 0) return p;
     const double base = mtp_tokens(p.t) / cost_ms(p.t);
-    const double q = lookup_rate(match);
-    double e = 1.0, qi = 1.0, best = 0.0;
+    const double q = lookup_rate(match, support);
+    double e = 1.0, best = 0.0;
     int best_t = 0;
-    for (int k = 1; k <= std::min(lookup_k, max_t_ - 1); ++k) {
-        qi *= q;
-        e += qi;
-        const double r = e / cost_ms(k + 1);
-        if (r > best) { best = r; best_t = k + 1; }
+    const int top = std::min(lookup_k, max_t_ - 1);
+    if (levels != nullptr && n_levels > 0) {
+        // the tree's own profile: level i is the probability the first i+1 drafts are all accepted, so the
+        // expected tokens of a window of k drafts is one plus the first k levels. Past the chain's depth the
+        // learned rate carries the estimate.
+        for (int k = 1; k <= top; ++k) {
+            e += k <= n_levels ? levels[k - 1] : levels[n_levels - 1] * q;
+            const double r = e / cost_ms(k + 1);
+            if (r > best) { best = r; best_t = k + 1; }
+        }
+    } else {
+        double qi = 1.0;
+        for (int k = 1; k <= top; ++k) {
+            qi *= q;
+            e += qi;
+            const double r = e / cost_ms(k + 1);
+            if (r > best) { best = r; best_t = k + 1; }
+        }
     }
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
@@ -81,16 +101,17 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     return p;
 }
 
-void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
+void DraftPolicy::observe(bool lookup, int t, int accepted, int match, int support, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
     }
     if (lookup) {
-        const int b = bucket(match);
-        ok_[b] = kDecay * ok_[b] + accepted;
-        bad_[b] = kDecay * bad_[b] + (accepted < t - 1 ? 1.0 : 0.0);
+        const int b = bucket(match), s = support_class(support);
+        const size_t i = (size_t) b * kSup + s;
+        ok_[i] = kDecay * ok_[i] + accepted;
+        bad_[i] = kDecay * bad_[i] + (accepted < t - 1 ? 1.0 : 0.0);
     } else {
         const double got = accepted + 1.0;
         mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;

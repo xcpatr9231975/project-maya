@@ -31,6 +31,16 @@ upstream PR #471 and stays where the owner leaves it.
    cursor advances only after a successful `journalctl` read; first run
    initialises without counting; boundary double-count is accepted over
    epsilon-drop.
+6. **Stall guard is a separate state machine.** `~/.gpu_monitor_stall_state`
+   (`stall-termed:<pid>:<starttime>:<ts>`) — never merge it into
+   `~/.gpu_monitor_guard_state`, or the memory guard's "unknown guard state"
+   branch discards it. It has NO two-sample rule on purpose: the confirmation
+   is the engine log's own mtime age (silent ≥ `STALL_QUIET_S`) *and* the GPU
+   being at ≥ `STALL_UTIL_PCT`, which is already a sustained condition. The
+   utilization gate is what keeps an idle engine (silent by design) safe —
+   never arm on silence alone. A stall kill clears a stale memory-guard
+   `armed:` state so it cannot frame another process; it leaves an in-flight
+   `termed:` alone.
 
 ## Workflow (the order that worked)
 

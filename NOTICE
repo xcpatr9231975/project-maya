@@ -35,6 +35,17 @@ plus these additions):
     - the token-size benchmark (tools/bench_tokens.py, BENCHMARK.md)
     - the Hugging Face publishing pipeline (docs/hf-dataset/,
       docs/hf-maya-s-v2-dgx-spark-README.md)
+    - the vote-counting suffix-lookup drafter
+      (include/strata/spec/suffix_drafter.hpp, src/spec/suffix_drafter.cpp)
+      and its corpus store (include/strata/ngram/corpus_store.hpp,
+      src/ngram/corpus_store.cpp, tools/build_corpus.py): they port the
+      counting half of the ngram drafter in TandemLLM (0xBakeer/TandemLLM,
+      engine/drafters/ngram.py, AGPL-3.0,
+      https://github.com/0xBakeer/TandemLLM), where every occurrence of a
+      match votes for the continuation that followed it, over both a
+      per-sequence index and a suffix array of a token corpus. They are
+      reimplemented from scratch against the hash table this drafter already
+      had, and no code is taken from it
 
 Everything else in this branch is upstream's, unchanged. The full account of
 what the port changed, where each component comes from and what other people

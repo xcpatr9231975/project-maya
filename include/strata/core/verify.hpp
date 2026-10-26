@@ -17,6 +17,19 @@
 // and the PLE history is set to its snapshot after token n_keep-1.  K/V cells past the accepted prefix are simply
 // overwritten when those positions are processed again, before any query can read them.
 //
+// WHAT A TREE WOULD NEED.  The window is a CHAIN: T tokens at consecutive positions, each attending to the
+// positions before it, and one recurrent state advanced by the accepted prefix.  A draft tree (the suffix
+// drafter's vote tree, `SuffixDrafter::last_expected`) branches, so verifying it rather than its best chain
+// needs three things this window does not have:
+//   * a per-row attention set - each node attends to its ancestors' rows and not to its siblings', where today
+//     the set is "every position at or before mine", which a DFS ordering would silently widen to include
+//     earlier branches' keys and change what the model picks;
+//   * a recurrent state per branch - the GDN state is one per layer, advanced along the accepted prefix at
+//     commit, where a tree needs it forked at every branch point (TandemLLM verifies trees through recurrent
+//     layers, so it is done, but it is the work);
+//   * a commit that keeps a path and rolls back its siblings' cells, where `commit(n_keep)` keeps a prefix.
+// Until then the drafter's tree chooses the chain this window verifies, and `last_expected` prices it.
+//
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once

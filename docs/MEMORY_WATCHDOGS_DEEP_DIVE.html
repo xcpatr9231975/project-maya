@@ -189,11 +189,13 @@
 </header>
 <h1 id="memory-watchdogs-on-the-dgx-spark-deep-dive">Memory Watchdogs on
 the DGX Spark — Deep Dive</h1>
-<p><em>Three independent guards, one failure mode: on GB10 unified
-memory, exhaustion hangs the kernel instead of raising OOM.</em></p>
+<p><em>Three independent guards, one recovery layer, one failure mode:
+on GB10 unified memory, exhaustion hangs the kernel instead of raising
+OOM.</em></p>
 <p><strong>Scope</strong>: <code>tools/gpu_monitor.py</code> +
-<code>safe-build.sh</code> (project-maya, this box) and
-<code>memwatch.sh</code> from <a
+<code>safe-build.sh</code> (project-maya, this box),
+<code>tools/hardlock-watchdog.sh</code> (the SBSA hardware-watchdog
+recovery) and <code>memwatch.sh</code> from <a
 href="https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/blob/main/files/memwatch.sh">MiaAI
 Lab’s Qwen3.8-Flash-Next-Single-DGX-Spark</a> (the vLLM deployment).
 Written 2026-10-25, re-verified through commits <code>b0304ab</code>
@@ -212,10 +214,14 @@ channel <code>/proc/meminfo</code> books under other names. The only
 honest probe is <code>cudaMemGetInfo</code> (device-free).</li>
 <li><strong>No OOM-killer rescue.</strong> When the pool runs out, the
 driver returns <code>NV_ERR_NO_MEMORY</code> and its error path
-deadlocks: the box hard-locks with nothing on the console, and with the
-kernel watchdog disabled (“NMI not fully supported”) only a power-cycle
-recovers it. Nobody reaps the offender for you; something must kill it
-<em>before</em> the floor is crossed.</li>
+deadlocks: the box hard-locks with nothing on the console. The kernel’s
+hard-lock detector is disabled here (“NMI not fully supported”), so the
+kernel never panics and never reboots; historically a human power-cycled
+the box. Nobody reaps the offender for you; something must kill it
+<em>before</em> the floor is crossed. Recovery is a separate layer: the
+SoC’s SBSA Generic Watchdog (<code>tools/hardlock-watchdog.sh</code>,
+layer 4) resets the box in hardware when userspace stops pinging
+it.</li>
 </ol>
 <p>So the box runs defense-in-depth:</p>
 <table>
@@ -256,6 +262,13 @@ recovers it. Nobody reaps the offender for you; something must kill it
 <td>every 1 s, debounced</td>
 <td>the vLLM container</td>
 <td>archive + marker + alert + <code>docker stop</code></td>
+</tr>
+<tr>
+<td>4 — recovery</td>
+<td><code>hardlock-watchdog.sh</code> (SBSA GWDT)</td>
+<td>30 s ping, two-stage</td>
+<td>the whole box</td>
+<td>hardware reset at 2x timeout</td>
 </tr>
 </tbody>
 </table>
@@ -493,6 +506,72 @@ in-repo and run in CI on every push:
 <p>Residual risks: pid reuse within the 300 s baseline window could
 mis-attribute (falls back to the old GPU pick); a breach from many
 processes each growing &lt;256 MiB falls back to the engine kill.</p>
+<h3 id="the-stall-guard-the-failure-no-floor-ever-saw-2026-10-25">1.8
+The stall guard — the failure no floor ever saw (2026-10-25)</h3>
+<p>The four hard locks the box actually died from (2026-10-24 19:40,
+2026-10-24 21:08, 2026-10-25 17:11, 2026-10-25 17:49) had nothing to do
+with any trigger above: device-free was 7–15 GiB against a 3.07 GiB
+floor, <code>N:</code> was 0, no guard state was ever armed, and the
+kernel log ended mid-sentence with no <code>NV_ERR_NO_MEMORY</code>, no
+Xid and no shutdown sequence. What the samples <em>do</em> show is the
+GPU at 94–95 % and 84–85 °C in the last line before the box went silent
+while memory was still healthy. On GB10 device memory <em>is</em> system
+RAM and the kernel watchdog is disabled (“NMI not fully supported”), so
+a GPU-side fault takes the whole box; no userspace watchdog can save it,
+but a hang that is still only the <em>engine</em> (host-side deadlock,
+stuck copy lane) is recoverable, and in both cases the evidence worth
+having is the engine’s own last output, which dies with the box.</p>
+<p>So the guard gained a second, independent state machine:</p>
+<ul>
+<li><strong>What it watches:</strong> the file the engine actually
+writes to — <code>/proc/&lt;engine&gt;/fd/2</code>, discovered per
+sample (fd 1 is a pipe to the server). No hardcoded path, so it follows
+whichever run is live.</li>
+<li><strong>When it fires:</strong> that file silent for
+<code>GPU_MONITOR_STALL_QUIET_S</code> (90 s) <em>while</em> the GPU is
+at ≥ <code>GPU_MONITOR_STALL_UTIL_PCT</code> (90 %). The utilization
+gate is the false-positive control: an idle engine is silent by design,
+and the longest legitimate silent stretch is one 32768-token prefill
+chunk (~46 s, chunk stage line silenced — normally the launcher prints a
+progress line every 10 s).</li>
+<li><strong>What it does:</strong> snapshots
+<code>~/gpu_reports/stall_&lt;ts&gt;.txt</code> (why,
+util/temp/device-free, <code>/proc/&lt;pid&gt;/status</code>, the
+engine’s last 40 lines), SIGTERMs the engine, escalates to SIGKILL after
+<code>GPU_MONITOR_STALL_GRACE_S</code> (30 s). The launcher restarts the
+engine on the next request, so a false positive costs one restart.</li>
+<li><strong>Always on, stall or not:</strong> a rolling copy of the
+engine’s tail in <code>~/gpu_engine_tail.txt</code>, rewritten every
+sample. A hard lock costs the engine its unflushed stdio buffer and the
+kernel leaves the lost region as NUL padding inside the log (1806 bytes
+measured at the 17:11 lock), so this is the only post-mortem record of
+what the model was doing.</li>
+<li><strong>Its own state file</strong>
+(<code>~/.gpu_monitor_stall_state</code>,
+<code>stall-termed:&lt;pid&gt;:&lt;starttime&gt;:&lt;ts&gt;</code>) —
+merging it into the memory guard’s state would have the “unknown guard
+state” branch discard it. No two-sample rule: the mtime age <em>is</em>
+the confirmation. A stall kill clears a stale memory-guard
+<code>armed:</code> state so it cannot frame another process, and leaves
+an in-flight <code>termed:</code> alone.</li>
+</ul>
+<p>Suite: <code>tools/test_gpu_monitor_stall.py</code> (18 checks — fd
+discovery, NUL-stripping tail, the
+idle/fresh/no-proc/unwatchable/disabled gates, the full
+term→drain→SIGKILL→restart cycle, stale-arm clearing, the rolling tail).
+<code>GPU_MONITOR_STALL_GUARD=0</code> disarms it.</p>
+<p>The 17:49 lock exposed the stall guard’s limit: its trigger is
+<em>silence</em>, and the engine was still emitting
+<code>thinking:</code> lines at 14.7 tok/s in the 17:49:23 sample — one
+second before the box died. A lock that kills the machine in the same
+sample as the engine’s last line gives a 90 s silence gate no runway.
+The answer to that case is not another userspace check but the hardware
+timer: <code>tools/hardlock-watchdog.sh</code> arms the SoC’s SBSA
+Generic Watchdog through systemd (<code>RuntimeWatchdogSec=30s</code>;
+WS0 panic then WS1 hardware reset) and sets
+<code>kernel.panic=15</code>, so a stalled PID 1 ends in a reset even
+when the kernel cannot run the panic path. That is recovery, not
+prevention — worst case ~2x the timeout.</p>
 <hr />
 <h2 id="safe-build.sh-the-build-watchdog">2. <code>safe-build.sh</code>
 — the build watchdog</h2>
@@ -917,6 +996,39 @@ make the engine refuse or queue new requests below a headroom threshold
 (vLLM’s preemption semantics). Then the guard demotes itself to what
 memwatch already is for qwen: a backstop for <em>external</em>
 allocators, not the primary defense.</p>
+<h3
+id="recovery-after-the-lock-the-sbsa-hardware-watchdog-2026-10-25">Recovery
+after the lock — the SBSA hardware watchdog (2026-10-25)</h3>
+<p>Every guard above assumes the kernel is still scheduling. The 17:49
+lock broke that assumption: the engine was still producing tokens and
+the journal simply ended. Userspace cannot recover that box, but the SoC
+can. The board exposes <code>/dev/watchdog0</code>, the SBSA Generic
+Watchdog (<code>sbsa_gwdt</code>), loaded in two-stage mode
+(<code>action=1</code>): at the first timeout (WS0) the driver panics;
+one more timeout later (WS1) the hardware asserts a reset. WS1 is a SoC
+line, not a Linux code path, so it fires even when the kernel is wedged
+with interrupts disabled.</p>
+<ul>
+<li><strong>Arming it:</strong> systemd 255 opens the device when
+<code>RuntimeWatchdogSec</code> is set and pings it from PID 1. When the
+box hard-locks, the pings stop and the hardware timer runs out.</li>
+<li><strong>The panic stage:</strong> <code>kernel.panic=15</code> makes
+WS0’s panic reboot after 15 s instead of hanging at the default
+<code>panic=0</code>. If the panic cannot run, WS1 resets at ~2x the
+timeout anyway (30 s default → worst case ~60 s).</li>
+<li><strong>What it is not:</strong> this is recovery, not prevention.
+In-flight generation is lost; the launcher restarts the engine. It does
+not replace the memory floors or the stall guard — it ends the manual
+power-cycle when they lose.</li>
+<li><strong>Tool:</strong>
+<code>tools/hardlock-watchdog.sh status</code> (read-only, no root),
+<code>sudo tools/hardlock-watchdog.sh apply</code> (writes the systemd
+drop-in and sysctl file, <code>systemctl daemon-reexec</code>, verifies
+<code>state=active</code>),
+<code>sudo tools/hardlock-watchdog.sh revert</code>. The kernel’s own
+hard-lock detector is still disabled (“NMI not fully supported”) and is
+not what this uses.</li>
+</ul>
 <h3 id="gaps-future-work">Gaps / future work</h3>
 <ul>
 <li><del>gpu_monitor: pid-reuse mis-attribution window</del> — closed by
@@ -950,9 +1062,9 @@ adopting any of them is future work.</li>
 <code>b4c59af</code>, <code>64dd854</code>, <code>2a2447d</code>,
 <code>b0304ab</code>, <code>360107e</code>, <code>cbef66d</code>,
 <code>e1f8f4b</code>, <code>67745c3</code> (+
-<code>docs/2026-10-25-guard-concurrency.md</code>, <code>NOTICE</code>);
-MiaAI-Lab upstream <code>files/memwatch.sh</code> +
-<code>scripts/alert.sh</code>; local
+<code>docs/2026-10-25-guard-concurrency.md</code>, <code>NOTICE</code>,
+<code>tools/hardlock-watchdog.sh</code>); MiaAI-Lab upstream
+<code>files/memwatch.sh</code> + <code>scripts/alert.sh</code>; local
 <code>logs/memwatch-vllm-fn-tp1.log</code>; memwatch sync of 2026-10-25
 (leak-trend + marker + alert + gate fix, pre-sync preserved as
 <code>files/memwatch.sh.pre-sync-20261025</code>); sandbox suites of
@@ -961,6 +1073,9 @@ starttime-baseline checks); qwen38FN deployment config
 (<code>~/qwen-autostart.sh</code>, GMU 0.78 / HOST_SLACK_GIB 2 /
 FREE_GATE 10) and the 2026-10-25 maya-S pressure drills
 (<code>~/gpu_monitor_guard.log</code>: four kills, all external
-growers).</em></p>
+growers); the 2026-10-25 17:49 hard lock
+(<code>~/gpu_engine_tail.txt</code>, <code>~/gpu_monitor_log.txt</code>,
+<code>journalctl -b -1</code>) and the SBSA Generic Watchdog driver
+(<code>drivers/watchdog/sbsa_gwdt.c</code>, ARM DEN0029B).</em></p>
 </body>
 </html>

@@ -27,6 +27,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/ngram/corpus_store.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -129,6 +130,7 @@ struct Options {
     /// from the manifest.  If Python agrees with the engine on the same `R`, the head is right and the layers
     /// are wrong; if it disagrees, the head is wrong.  Nothing else in the engine can be split that cheaply.
     std::string ple_gguf;              // the ORIGINAL second GGUF shard: the PLE table is not in the pack
+    std::string corpus_store;          // the lookup drafter's corpus (tools/build_corpus.py); empty = the request's own text only
     bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
@@ -443,6 +445,8 @@ void usage() {
                  "                       of the batched prompt path (default 64, 0 = off)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
+                 "  --corpus PATH        the lookup drafter's corpus store (tools/build_corpus.py): a second vote\n"
+                 "                       source over tens of millions of tokens (default: the request's own text)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
@@ -4360,6 +4364,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
+        else if (a == "--corpus") o.corpus_store = next("--corpus");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
@@ -7008,6 +7013,21 @@ int main(int argc, char** argv) {
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // The corpus store: the drafter's second vote source, over text this request has never seen. It is
+        // opened once per process and shared by every request, as the PLE table is.
+        strata::ngram::CorpusStore corpus;
+        if (!o.corpus_store.empty()) {
+            std::string cerr;
+            // The vocabulary size is not at hand here, so the separator is not checked against it: the builder
+            // refuses a separator that does not fit an int32, and its default is far above any vocabulary.
+            if (!corpus.open(o.corpus_store, cerr, "", 0)) {
+                std::fprintf(stderr, "maya serve: --corpus: %s\n", cerr.c_str());
+                return 1;
+            }
+            if (o.suffix_draft > 0) sfx.set_corpus(&corpus);
+            std::printf("  corpus store: %s (%llu tokens, matches up to %u, tokenizer %s)\n", o.corpus_store.c_str(),
+                        (unsigned long long) corpus.n_tokens(), corpus.max_order(), corpus.tokenizer().c_str());
+        }
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more maya-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -7588,12 +7608,14 @@ int main(int argc, char** argv) {
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
-                int sfx_match = 0;
+                int sfx_match = 0, sfx_support = 0;
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
+                    sfx_support = sfx.last_support();
                     if (k > 0 && sbuf[0] == drafts[0]) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        const strata::spec::DraftPolicy::Pick pk =
+                            policy.choose(T, k, sfx_match, sfx_support, sfx.last_levels(), sfx.last_levels_n());
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
@@ -7682,7 +7704,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (timed_round && !eos)
-                    policy.observe(from_sfx, T, a, sfx_match,
+                    policy.observe(from_sfx, T, a, sfx_match, sfx_support,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
@@ -7843,6 +7865,11 @@ int main(int argc, char** argv) {
             if (sfx_windows > 0)
                 std::fprintf(stderr, "maya serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+            if (corpus.is_open() && corpus.lookups() > 0)
+                std::fprintf(stderr, "maya serve: corpus store: %llu lookups, %llu matched (%.1f%%), %.2f us each\n",
+                             (unsigned long long) corpus.lookups(), (unsigned long long) corpus.hits(),
+                             100.0 * (double) corpus.hits() / (double) corpus.lookups(),
+                             corpus.lookup_us() / (double) corpus.lookups());
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "maya serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
@@ -8321,6 +8348,20 @@ int main(int argc, char** argv) {
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        // The corpus store: the drafter's second vote source, over text this request has never seen.
+        strata::ngram::CorpusStore corpus;
+        if (!o.corpus_store.empty()) {
+            std::string cerr;
+            // The vocabulary size is not at hand here, so the separator is not checked against it: the builder
+            // refuses a separator that does not fit an int32, and its default is far above any vocabulary.
+            if (!corpus.open(o.corpus_store, cerr, "", 0)) {
+                std::fprintf(stderr, "maya generate: --corpus: %s\n", cerr.c_str());
+                return 1;
+            }
+            if (o.suffix_draft > 0) sfx.set_corpus(&corpus);
+            std::printf("  corpus store: %s (%llu tokens, matches up to %u, tokenizer %s)\n", o.corpus_store.c_str(),
+                        (unsigned long long) corpus.n_tokens(), corpus.max_order(), corpus.tokenizer().c_str());
+        }
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {
@@ -8338,12 +8379,14 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
-            int sfx_match = 0;
+            int sfx_match = 0, sfx_support = 0;
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
+                sfx_support = sfx.last_support();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    const strata::spec::DraftPolicy::Pick pk =
+                        policy.choose(T, k, sfx_match, sfx_support, sfx.last_levels(), sfx.last_levels_n());
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
@@ -8420,7 +8463,7 @@ int main(int argc, char** argv) {
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
-            if (timed_round) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            if (timed_round) policy.observe(from_sfx, T, a, sfx_match, sfx_support, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "maya generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
@@ -8437,6 +8480,11 @@ int main(int argc, char** argv) {
         if (o.suffix_draft > 0)
             std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
                         (long long) sfx_ok, (long long) sfx_drafts);
+        if (corpus.is_open() && corpus.lookups() > 0)
+            std::printf("%-24s %llu lookups, %llu matched (%.1f%%), %.2f us each\n", "corpus store",
+                        (unsigned long long) corpus.lookups(), (unsigned long long) corpus.hits(),
+                        100.0 * (double) corpus.hits() / (double) corpus.lookups(),
+                        corpus.lookup_us() / (double) corpus.lookups());
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
