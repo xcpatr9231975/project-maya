@@ -377,6 +377,9 @@ void usage() {
                  "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
                  "                       them together (each weight read once for all); a split pipelines them\n"
                  "                       across its cards. Each extra conversation keeps its own context state\n"
+                 "  --admit-check        print the admission decision for this device (free vs borrow + floor) and\n"
+                 "                       exit 0 (admit) or 1 (refuse); no model is loaded.  The numbers come from\n"
+                 "                       STRATA_GLM_ADMIT_FLOOR_MIB / _BORROW_MIB.\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
@@ -1049,11 +1052,15 @@ static bool cuda_context_broken(const std::string& why) {
 // pattern).  write(2) is async-signal-safe, so the handler may do it.
 static std::atomic<bool> g_sigterm{false};
 static int g_sigterm_pipe[2] = {-1, -1};
+// what the handler writes to, as a volatile sig_atomic_t: the only object a handler may read.  It is published
+// (assigned) before the handler is installed, so the handler never reads a half-published fd.
+static volatile sig_atomic_t g_sigterm_write_fd = -1;
 extern "C" void strata_on_sigterm(int) {
     g_sigterm.store(true);
-    if (g_sigterm_pipe[1] >= 0) {
+    const int fd = (int) g_sigterm_write_fd;
+    if (fd >= 0) {
         const char c = 1;
-        (void)!write(g_sigterm_pipe[1], &c, 1);     // wakes the thread that waits for stdin
+        (void)!write(fd, &c, 1);     // wakes the thread that waits for stdin
     }
 }
 
@@ -1066,18 +1073,68 @@ extern "C" void strata_on_sigterm(int) {
 //   STRATA_GLM_ADMIT=0            the check off (it is on by default)
 //   STRATA_GLM_ADMIT_FLOOR_MIB    the floor to keep (default 3072, the memory guard's)
 //   STRATA_GLM_ADMIT_WAIT_S       how long to wait for room before refusing (default 120)
+//   STRATA_GLM_ADMIT_STALL_S      how long with NO improvement before refusing early (default 30: the memory
+//                                 guard's own grace, so this never refuses before the guard would have acted)
 //   STRATA_GLM_ADMIT_BORROW_MIB   the borrow to assume (default: the engine's own)
-static bool admit_room(strata::core::Glm5Model& model, std::string& why) {
-    if (const char* off = std::getenv("STRATA_GLM_ADMIT")) {
-        if (std::atoi(off) == 0) return true;
-    }
+//
+// A wait that is not making progress is a wait that will not.  2026-10-26: the engine's own held session state (a
+// 239544-token conversation, 3.19 GB) took device-free to 4 GiB and kept it there, so every request burned the
+// full WAIT_S before being refused - 8 x 120 s, the engine idle and useless until a restart.  Past STALL_S with no
+// improvement the request is refused early, and the message says which of the two it was: our own held state
+// (device-free below where this engine last admitted, so only a restart returns it) or someone else's (a longer
+// wait would have helped).
+static std::atomic<int64_t> g_admit_free_at_success{-1};
+
+// The knobs, read once per decision: shared by the gate and by --admit-check so a test drives the same numbers.
+struct AdmitKnobs {
     int64_t floor_mib = 3072;
-    if (const char* v = std::getenv("STRATA_GLM_ADMIT_FLOOR_MIB")) floor_mib = std::max<int64_t>(0, std::atoll(v));
+    int64_t borrow_mib = 0;     // 0: the engine's own (only the gate can supply it)
     double wait_s = 120.0;
-    if (const char* v = std::getenv("STRATA_GLM_ADMIT_WAIT_S")) wait_s = std::max(0.0, std::atof(v));
-    int64_t borrow_mib = (int64_t) (model.prefill_borrow_bytes() >> 20);
-    if (const char* v = std::getenv("STRATA_GLM_ADMIT_BORROW_MIB")) borrow_mib = std::max<int64_t>(0, std::atoll(v));
-    const int64_t need_mib = borrow_mib + floor_mib;
+    double stall_s = 30.0;
+};
+static AdmitKnobs admit_knobs() {
+    AdmitKnobs k;
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_FLOOR_MIB")) k.floor_mib = std::max<int64_t>(0, std::atoll(v));
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_BORROW_MIB")) k.borrow_mib = std::max<int64_t>(0, std::atoll(v));
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_WAIT_S")) k.wait_s = std::max(0.0, std::atof(v));
+    if (const char* v = std::getenv("STRATA_GLM_ADMIT_STALL_S")) k.stall_s = std::max(0.0, std::atof(v));
+    return k;
+}
+static bool admit_on() {
+    if (const char* off = std::getenv("STRATA_GLM_ADMIT")) return std::atoi(off) != 0;
+    return true;
+}
+// The room a request needs: its borrow plus the floor that must stay free.  Pure, so a test can call it.
+static int64_t admit_need_mib(int64_t borrow_mib, int64_t floor_mib) { return borrow_mib + floor_mib; }
+// Why a request was not started.  It opens with "out of memory" because serve/server.py's out_of_memory() maps
+// that to a 503 (try again) rather than a 400 (the request was wrong).
+static std::string admit_refusal(int64_t free_mib, int64_t borrow_mib, int64_t floor_mib, double waited,
+                                 bool stalled, bool own_held) {
+    char buf[384];
+    if (stalled)
+        std::snprintf(buf, sizeof buf,
+                      "out of memory: the device has %lld MiB free and this request needs %lld MiB (the prompt "
+                      "path's borrow %lld MiB + the %lld MiB floor); nothing came back in %.0f s%s, so the request "
+                      "was not started",
+                      (long long) free_mib, (long long) admit_need_mib(borrow_mib, floor_mib), (long long) borrow_mib,
+                      (long long) floor_mib, waited,
+                      own_held ? " - what is holding it is this engine's own state (the saved conversations); an "
+                                 "engine restart returns it"
+                               : " - it is another process's memory, so a later request may fit");
+    else
+        std::snprintf(buf, sizeof buf,
+                      "out of memory: the device has %lld MiB free and this request needs %lld MiB (the prompt "
+                      "path's borrow %lld MiB + the %lld MiB floor); the request was not started",
+                      (long long) free_mib, (long long) admit_need_mib(borrow_mib, floor_mib), (long long) borrow_mib,
+                      (long long) floor_mib);
+    return buf;
+}
+
+static bool admit_room(strata::core::Glm5Model& model, std::string& why) {
+    if (!admit_on()) return true;
+    const AdmitKnobs k = admit_knobs();
+    int64_t borrow_mib = k.borrow_mib ? k.borrow_mib : (int64_t) (model.prefill_borrow_bytes() >> 20);
+    const int64_t need_mib = admit_need_mib(borrow_mib, k.floor_mib);
     int dev = 0;
     if (model.fast() && !model.pool_vram().empty()) dev = model.pool_vram()[0].dev;
     const auto free_mib = [&] {
@@ -1092,29 +1149,66 @@ static bool admit_room(strata::core::Glm5Model& model, std::string& why) {
     };
     const auto t0 = std::chrono::steady_clock::now();
     double noted = 0;
+    int64_t best = -1;          // the most device-free seen in this wait
+    double best_at = 0.0;       // when that was: no improvement for STALL_S is a stall
     for (;;) {
         const int64_t free = free_mib();
         if (free < 0) return true;
-        if (free >= need_mib) return true;
+        if (free >= need_mib) {
+            g_admit_free_at_success.store(free);
+            return true;
+        }
+        if (free > best) {
+            best = free;
+            best_at = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
         const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (waited >= wait_s) {
-            char buf[256];
-            std::snprintf(buf, sizeof buf,
-                          "out of memory: the device has %lld MiB free and this request needs %lld MiB "
-                          "(the prompt path's borrow %lld MiB + the %lld MiB floor); the request was not started",
-                          (long long) free, (long long) need_mib, (long long) borrow_mib, (long long) floor_mib);
-            why = buf;
+        const bool stalled = waited - best_at >= k.stall_s;
+        if (waited >= k.wait_s || stalled) {
+            const int64_t at_success = g_admit_free_at_success.load();
+            const bool own = at_success >= 0 && free < at_success;   // below our own last admission: our held state
+            why = admit_refusal(free, borrow_mib, k.floor_mib, waited, stalled && waited < k.wait_s, own);
             return false;
         }
         if (waited - noted >= 10.0) {     // a line every 10 s: the server's stall check sees the engine working
             noted = waited;
             std::printf("NOTE waiting for room: %lld MiB free, %lld MiB needed (the borrow %lld MiB + the %lld MiB "
                         "floor)\n",
-                        (long long) free, (long long) need_mib, (long long) borrow_mib, (long long) floor_mib);
+                        (long long) free, (long long) need_mib, (long long) borrow_mib, (long long) k.floor_mib);
             std::fflush(stdout);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+}
+
+// --admit-check: the gate's arithmetic, without a model, without tokens, without a request.  Prints the decision
+// and exits 0 (admit) or 1 (refuse), so a test can drive the safety-critical path hermetically:
+//
+//   STRATA_GLM_ADMIT_FLOOR_MIB=3072 STRATA_GLM_ADMIT_BORROW_MIB=4417 ./build/maya --admit-check
+//   STRATA_GLM_ADMIT_FLOOR_MIB=100000 ./build/maya --admit-check        # an absurd floor: refuse, exit 1
+static int admit_check() {
+    if (!admit_on()) {
+        std::printf("admit-check: the admission check is off (STRATA_GLM_ADMIT=0): every request is admitted\n");
+        return 0;
+    }
+    const AdmitKnobs k = admit_knobs();
+    size_t fb = 0, tb = 0;
+    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "admit-check: the device's free memory could not be read; nothing to decide\n");
+        return 2;
+    }
+    const int64_t free_mib = (int64_t) (fb >> 20);
+    const int64_t need_mib = admit_need_mib(k.borrow_mib, k.floor_mib);
+    if (free_mib >= need_mib) {
+        std::printf("admit-check: device free %lld MiB, need %lld MiB (borrow %lld MiB + floor %lld MiB) -> admit\n",
+                    (long long) free_mib, (long long) need_mib, (long long) k.borrow_mib, (long long) k.floor_mib);
+        return 0;
+    }
+    std::printf("admit-check: device free %lld MiB, need %lld MiB (borrow %lld MiB + floor %lld MiB) -> refuse: %s\n",
+                (long long) free_mib, (long long) need_mib, (long long) k.borrow_mib, (long long) k.floor_mib,
+                admit_refusal(free_mib, k.borrow_mib, k.floor_mib, 0.0, false, false).c_str());
+    return 1;
 }
 
 static int glm_pack_generate(const Options& o) {
@@ -1123,23 +1217,39 @@ static int glm_pack_generate(const Options& o) {
     // aside (STRATA_GLM_SLOT_KEEP).  A SIGTERM ends it the same way, at the next token and not mid-write; a server
     // that is already gone must not end it with SIGPIPE when it writes its last lines.
     if (o.serve) {
-        // sigaction, not signal: glibc's signal() sets SA_RESTART, so the blocked read() on stdin would restart
-        // itself and the engine would never notice the signal.  Without SA_RESTART the read() returns EINTR, the
-        // reader thread sees the flag and ends the engine the way QUIT does.
-        struct sigaction sa;
-        std::memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = strata_on_sigterm;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGTERM, &sa, nullptr);
-        std::signal(SIGINT, SIG_IGN);
-        std::signal(SIGPIPE, SIG_IGN);
-        // the pipe the handler writes to (see g_sigterm_pipe): non-blocking on both ends, so the handler never
-        // blocks and the reader never waits on an empty pipe
+        // The pipe the handler writes to (see g_sigterm_pipe): non-blocking on both ends, so the handler never
+        // blocks and the reader never waits on an empty pipe.  It is created BEFORE the handler is installed - the
+        // handler reads g_sigterm_write_fd, and a SIGTERM arriving between sigaction() and pipe() would otherwise
+        // read an fd no store has published yet.
+        bool sigterm_wired = false;
         if (pipe(g_sigterm_pipe) == 0) {
             fcntl(g_sigterm_pipe[0], F_SETFL, fcntl(g_sigterm_pipe[0], F_GETFL, 0) | O_NONBLOCK);
             fcntl(g_sigterm_pipe[1], F_SETFL, fcntl(g_sigterm_pipe[1], F_GETFL, 0) | O_NONBLOCK);
+            g_sigterm_write_fd = g_sigterm_pipe[1];      // published before the handler can run
+            sigterm_wired = true;
+        } else {
+            // No pipe means the handler cannot wake the reader, so SIGTERM would be swallowed again - the exact bug
+            // this whole path exists to fix (the engine held its 76 GB pool through the guard's 30 s grace and was
+            // SIGKILLed, and the engine that started next found the device full).  Leave SIGTERM at its default
+            // instead: the engine then ends at once, which frees the pool when the process dies, and the guard
+            // never has to escalate.
+            g_sigterm_pipe[0] = g_sigterm_pipe[1] = -1;
+            std::fprintf(stderr, "maya serve: the SIGTERM pipe could not be created (%s); SIGTERM ends the engine "
+                                 "at once instead of at its next token\n", std::strerror(errno));
         }
+        // sigaction, not signal: glibc's signal() sets SA_RESTART, so the blocked read() on stdin would restart
+        // itself and the engine would never notice the signal.  Without SA_RESTART the read() returns EINTR, the
+        // reader thread sees the flag and ends the engine the way QUIT does.
+        if (sigterm_wired) {
+            struct sigaction sa;
+            std::memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = strata_on_sigterm;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;
+            sigaction(SIGTERM, &sa, nullptr);
+        }
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGPIPE, SIG_IGN);
     }
 #endif
     strata::core::Glm5Model model;
@@ -4441,6 +4551,7 @@ int main(int argc, char** argv) {
         };
         bool handled = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
+        else if (a == "--admit-check") return admit_check();   // the gate's arithmetic, no model and no request
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--glm-pack") o.glm_pack = next("--glm-pack");
         else if (a == "--glm-ram-resident") {
