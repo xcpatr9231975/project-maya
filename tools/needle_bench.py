@@ -28,6 +28,41 @@ SOURCES = [("docs", "*.md"), ("src", "*.cpp"), ("src", "*.cu"), ("include", "*.h
 WORDS = ["amber", "falcon", "quartz", "willow", "copper", "harbor", "saffron", "glacier", "orchid", "lantern",
          "meadow", "cobalt", "juniper", "tundra", "velvet", "ember"]
 CHARS_PER_TOKEN = 3.2
+# The device memory a length needs before it is worth starting: the conversation's state in the engine
+# (~15 B/token, measured 0.51 GB at 27.9k to 3.19 GB at 239.5k), the prompt path's borrow the gate reports at
+# boot ("borrowing N MB of the expert pool"), and the 3072 MiB floor the memory guard keeps.  A length that
+# does not fit is skipped, not run into the floor: the gate would refuse it anyway (HTTP 503), after 30 s.
+BORROW_MIB = 4417
+FLOOR_MIB = 3072
+
+
+def length_fits(tokens: int, free_mib: int | None) -> tuple[bool, int]:
+    """(fits, MiB needed): the conversation's state in the engine (~15 B/token, measured 0.51 GB at 27.9k to
+    3.19 GB at 239.5k), the prompt path's borrow, and the 3072 MiB floor the memory guard keeps.  `None` free
+    (the device cannot be read) admits: the gate would refuse a request that does not fit, with a 503."""
+    need = int(tokens * 15 / 1024) + BORROW_MIB + FLOOR_MIB
+    return free_mib is None or free_mib >= need, need
+
+
+def device_free_mib() -> int | None:
+    """Free device memory in MiB via cudaMemGetInfo (ctypes).  NVML reports "Not Supported" for memory on GB10,
+    and this is the pool the driver allocates from and the memory guard watches (`F:` in the monitor log)."""
+    import ctypes, glob
+    lib = None
+    for c in sorted(glob.glob("/usr/local/cuda*/lib64/libcudart.so*"), reverse=True) + ["libcudart.so"]:
+        try:
+            lib = ctypes.CDLL(c)
+            lib.cudaMemGetInfo.restype = ctypes.c_int
+            lib.cudaMemGetInfo.argtypes = [ctypes.POINTER(ctypes.c_size_t)] * 2
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return None
+    free, total = ctypes.c_size_t(0), ctypes.c_size_t(0)
+    if lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) != 0:
+        return None
+    return int(free.value >> 20)
 
 
 def haystack(n_chars: int) -> str:
@@ -86,6 +121,12 @@ def main() -> int:
         tokens = int(tokens * 0.98)                        # "128k" fits a 128K context with room to answer
         if ctx and tokens + 200 > ctx:
             print(f"{L:>5}: skipped (the server's context is {ctx})")
+            continue
+        free = device_free_mib()
+        fits, need = length_fits(tokens, free)
+        if not fits:
+            print(f"{L:>5}: skipped (the device has {free:,} MiB free, this length needs ~{need:,} MiB: "
+                  f"the state {int(tokens * 15 / 1024):,} + the borrow {BORROW_MIB:,} + the floor {FLOOR_MIB:,})")
             continue
         text = haystack(int(tokens * CHARS_PER_TOKEN))
         for d in (int(x) for x in a.depths.split(",")):
