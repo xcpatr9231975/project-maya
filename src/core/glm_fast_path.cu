@@ -7111,6 +7111,12 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
         }
         m->pos_ = pos;
         m->mtp_hx_pos_ = -1;   // (head_x is not the checkpoint's)
+        // The checkpoint's token prefix two conversations can share (the same haystack's first 16k, say), so the
+        // state it restores is legitimate - but the KV streaming's block maps still name the conversation that ran
+        // last, and its resident window holds that conversation's last positions.  Measured 2026-10-26: answers
+        // arrived quoting a needle word that sat ~92k tokens into a conversation that had ended an hour before.
+        // slot_load has said this since the slots: "the slots held the other conversation's blocks".
+        m->kv_stream_reset_maps();
     }
     // the drafter's positions from here on belong to the previous continuation (as snapshot_restore)
     if (cap_d_ != nullptr) cap_d_->reset(pos_);

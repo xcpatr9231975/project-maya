@@ -54,12 +54,18 @@ def main() -> int:
     globals()["TOKENS"] = a.tokens
     url, key, cut = a.url, a.api_key, a.cut
     if a.prime_tokens > a.tokens:
-        text = haystack(int(a.prime_tokens * CHARS_PER_TOKEN))
-        prime = text + "\n\nReply with the word PRIMED and nothing else."
+        # The priming conversation carries a needle word of its own, deep in its tail: the bleed needs a
+        # DISTINGUISHING token beyond the probes' reach (the 12:38 case was the needle runs' word at ~92k).
+        prime_word = "cobalt-juniper-864"
+        ptext = haystack(int(a.prime_tokens * CHARS_PER_TOKEN))
+        pcut = int(len(ptext) * 0.9)
+        pcut = ptext.rfind("\n", 0, pcut) + 1 or pcut
+        prime = ptext[:pcut] + f"\nThe secret code word for this text is: {prime_word}. Remember it.\n" + \
+            ptext[pcut:] + "\n\nWhat is the secret code word mentioned above? Reply with the code word only."
         t0 = time.time()
         ans, n, secs = ask(url, key, prime, 1800)
-        print(f"prime: {n:,} prompt tokens in {secs:.0f} s (the engine's state now holds a longer conversation)",
-              flush=True)
+        print(f"prime: {n:,} prompt tokens in {secs:.0f} s, needle {prime_word} at ~90% of the priming text "
+              f"(answer: {ans!r})", flush=True)
         time.sleep(2)
     word_a, word_b = "amber-lantern-311", "saffron-velvet-707"
     print(f"P1: the first conversation (needle at {cut:.0%})")
