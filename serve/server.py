@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import codecs
+import glob
 import itertools
 import json
 import os
@@ -74,6 +75,31 @@ def _proc_cmdline(pid: int) -> str:
         return Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def device_free_mib() -> int | None:
+    """Free device memory in MiB, from cudaMemGetInfo through ctypes - the pool the driver actually allocates
+    from.  On GB10 that is system DRAM, and NVML cannot report it ("Not Supported"), so this is the only way.
+
+    The point for a start: an engine that has *exited* can still hold its memory for a few seconds while the
+    driver frees it, and NVML stops listing the process at once - so "no engine pid listed" is not "the device
+    is free".  The caller watches this number settle instead."""
+    import ctypes
+    lib = None
+    for c in sorted(glob.glob("/usr/local/cuda*/lib64/libcudart.so*"), reverse=True) + ["libcudart.so"]:
+        try:
+            lib = ctypes.CDLL(c)
+            lib.cudaMemGetInfo.restype = ctypes.c_int
+            lib.cudaMemGetInfo.argtypes = [ctypes.POINTER(ctypes.c_size_t)] * 2
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return None
+    free, total = ctypes.c_size_t(0), ctypes.c_size_t(0)
+    if lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) != 0:
+        return None
+    return int(free.value >> 20)
 
 
 def wait_gpu_release(pid: int, timeout: float = 60.0):
@@ -699,6 +725,27 @@ class StrataEngine:
         exe = str(self.spawn[0])
         return {pid for pid in pids if exe in _proc_cmdline(pid)}
 
+    def _memory_settled(self, timeout: float = 60.0) -> bool:
+        """The device's free memory has stopped growing: the driver is done freeing an ended engine.  A process can
+        be gone (NVML lists nothing) while the driver is still releasing tens of GB - starting inside that window
+        is how an engine finds its pool unsizeable ("no room for the expert pool: 0 slots a layer")."""
+        free = device_free_mib()
+        if free is None:
+            return True                       # cannot tell (no CUDA runtime readable): do not block the start
+        deadline = time.monotonic() + timeout
+        still = free
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            now = device_free_mib()
+            if now is None:
+                return True
+            if now <= still + 64:             # within 64 MiB of the last read: the release has settled
+                return True
+            still = now
+        print(f"[maya] the device's free memory kept growing for {timeout:.0f} s (now {still} MiB); starting anyway",
+              flush=True)
+        return True
+
     def _make_room(self, timeout: float = 120.0, wait: float = 8.0, sigkill_after: float = 40.0):
         """One engine at a time: a start waits until the GPU is free of our engine.  Two engines do not fit on this
         box - one pool of 65 GB each in 119 GB of shared memory - and the newcomer that finds the device full is
@@ -731,6 +778,7 @@ class StrataEngine:
         still = self._engine_pids()
         if still:
             print(f"[maya] the GPU still lists an engine (pids {sorted(still)}); starting anyway", flush=True)
+        self._memory_settled()                # the driver may still be freeing an ended engine's memory
 
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
@@ -804,7 +852,27 @@ class StrataEngine:
         ctx = self.max_context
         self.ended = False
         try:
-            self.__init__(*self.spawn)
+            # A start can fail because the driver is still freeing the *previous* engine's memory: the engine then
+            # refuses its own pool ("no room for the expert pool: 0 slots a layer") and exits before it was ready.
+            # The memory comes back within seconds, so that one reason is waited for and retried; every other
+            # failure raises.
+            deadline = time.monotonic() + 180.0
+            while True:
+                try:
+                    self.__init__(*self.spawn)
+                    break
+                except RuntimeError as e:
+                    tail = ""
+                    if self.log_path:
+                        try:
+                            tail = Path(self.log_path).read_text(encoding="utf-8", errors="replace")[-4000:]
+                        except OSError:
+                            tail = ""
+                    if "no room for the expert pool" not in tail or time.monotonic() > deadline:
+                        raise
+                    print("[maya] the engine could not size its expert pool: the previous engine's memory is still "
+                          "being freed; waiting for it ...", flush=True)
+                    time.sleep(5)
         except Exception:
             # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
             #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
