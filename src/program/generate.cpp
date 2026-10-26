@@ -93,6 +93,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <poll.h>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -1036,16 +1038,48 @@ static bool cuda_context_broken(const std::string& why) {
     return false;
 }
 
+// A SIGTERM to the engine - the memory guard's, or a supervisor's - ends it the way QUIT does: the request in
+// flight is cut at its next token, the conversation is set aside (STRATA_GLM_SLOT_KEEP) and the pool is freed, so
+// the driver gets the memory back at once.  Ignoring SIGTERM (what this used to do) left the engine holding its
+// whole pool - 76 GB on this box - for the guard's 30 s grace, and then SIGKILL ended it: the memory came back
+// late, and the engine that started next found the device full (NV_ERR_NO_MEMORY) with the old one still resident.
+//
+// A process-directed signal is delivered to any thread that does not block it, so the thread waiting on stdin may
+// not be the one the handler runs in: the handler writes to a pipe and the waiting thread reads it (the self-pipe
+// pattern).  write(2) is async-signal-safe, so the handler may do it.
+static std::atomic<bool> g_sigterm{false};
+static int g_sigterm_pipe[2] = {-1, -1};
+extern "C" void strata_on_sigterm(int) {
+    g_sigterm.store(true);
+    if (g_sigterm_pipe[1] >= 0) {
+        const char c = 1;
+        (void)!write(g_sigterm_pipe[1], &c, 1);     // wakes the thread that waits for stdin
+    }
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
-    // aside (STRATA_GLM_SLOT_KEEP).  A SIGTERM to the whole process group (systemd stopping a service, a supervisor
-    // killing the server's group) must not end it mid-write; a server that is already gone must not end it with
-    // SIGPIPE when it writes its last lines.
+    // aside (STRATA_GLM_SLOT_KEEP).  A SIGTERM ends it the same way, at the next token and not mid-write; a server
+    // that is already gone must not end it with SIGPIPE when it writes its last lines.
     if (o.serve) {
-        std::signal(SIGTERM, SIG_IGN);
+        // sigaction, not signal: glibc's signal() sets SA_RESTART, so the blocked read() on stdin would restart
+        // itself and the engine would never notice the signal.  Without SA_RESTART the read() returns EINTR, the
+        // reader thread sees the flag and ends the engine the way QUIT does.
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = strata_on_sigterm;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, nullptr);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+        // the pipe the handler writes to (see g_sigterm_pipe): non-blocking on both ends, so the handler never
+        // blocks and the reader never waits on an empty pipe
+        if (pipe(g_sigterm_pipe) == 0) {
+            fcntl(g_sigterm_pipe[0], F_SETFL, fcntl(g_sigterm_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+            fcntl(g_sigterm_pipe[1], F_SETFL, fcntl(g_sigterm_pipe[1], F_GETFL, 0) | O_NONBLOCK);
+        }
     }
 #endif
     strata::core::Glm5Model model;
@@ -1200,6 +1234,32 @@ static int glm_pack_generate(const Options& o) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
+#if !defined(_WIN32)
+                    // Wait for stdin or for the SIGTERM pipe: the signal is delivered to any thread, so the one
+                    // blocked here may not be the one the handler runs in - the handler writes to the pipe, and
+                    // this is what turns the signal into an end.
+                    struct pollfd pfd[2];
+                    pfd[0].fd = 0;
+                    pfd[0].events = POLLIN;
+                    pfd[1].fd = g_sigterm_pipe[0];
+                    pfd[1].events = POLLIN;
+                    const int pr = poll(pfd, 2, -1);
+                    if (pr < 0) {
+                        if (errno == EINTR) continue;
+                        return false;
+                    }
+                    if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+                        char c = 0;
+                        (void)::read(g_sigterm_pipe[0], &c, 1);
+                        // SIGTERM (the memory guard's, a supervisor's): end the engine the way QUIT does - the
+                        // request in flight stops at its next token, the loop ends, and the pool is freed at once
+                        // instead of after the guard's 30 s grace and a SIGKILL.
+                        quit_req.store(true);
+                        stop_req.store(true);
+                        return false;                   // EOF: in_eof below wakes the request waiting for a line
+                    }
+                    if (!(pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+#endif
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
 #else
@@ -3961,6 +4021,7 @@ static int glm_pack_generate(const Options& o) {
         std::string cmd;
         ss >> cmd;
         if (cmd == "QUIT") break;
+        if (g_sigterm.load()) break;      // SIGTERM (the guard's, a supervisor's): the same end as QUIT
         if (multi && !gens.empty() && (cmd == "VLEND" || cmd == "VRECLAIM" || cmd == "LOGP")) {
             std::printf("ERR %s needs the engine idle (%zu requests running)\n", cmd.c_str(), gens.size());
             continue;

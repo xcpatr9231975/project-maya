@@ -164,6 +164,55 @@ config's env after `os.environ`, so the config always wins.
 
 ## Defects found (not driver-related)
 
+### 0. The restart path: two engines on one device, and the driver refusing memory
+
+Found while the regression was running, at 2026-10-26 07:36. The guard's samples and log:
+
+| time | what | `F:` | `N:` |
+|---|---|---|---|
+| 07:36:26 | one engine (pid 243594) holding 76409 MiB | 8.11 GiB | 0 |
+| 07:36:37 | **a second engine appears** (pid 248342) - 83847 MiB on a 119 GB device | **0.96 GiB** | 0 |
+| 07:36:48 | the newcomer is gone; the driver refused its allocation | 9.76 GiB | **1** |
+| 07:37:22 | the guard SIGKILLs the resident engine (its SIGTERM was ignored) | 2.37 GiB | 0 |
+| 07:38:03 | the server starts another engine - and another overlap follows | 4.73 GiB | 0 |
+| 07:38:37 | it settles | 19.58 GiB | 0 |
+
+Four engine starts in 90 seconds, and the one `N:` - a real `NV_ERR_NO_MEMORY` - is the
+warning shot the hard-lock triage names as the precursor of a freeze. Two causes, both
+fixed here:
+
+**(a) The engine ignored SIGTERM.** `generate.cpp` installed `SIG_IGN` for SIGTERM so a
+group-wide SIGTERM (systemd stopping the service) could not end it mid-write. So the
+guard's SIGTERM did nothing: the engine kept its whole pool - 76 GB - for the guard's
+30 s grace, and then had to be SIGKILLed. The memory came back late, and the engine
+that started next found the device full. The engine now ends on SIGTERM the way QUIT
+does: the request in flight is cut at its next token, the conversation is set aside, the
+pool is freed and the process exits.
+
+The handler needed two details, both of which cost a build each:
+
+- `signal()` is not enough: glibc's `signal()` sets `SA_RESTART`, so the blocked `read()`
+  on stdin restarted itself and the engine never noticed. `sigaction()` without
+  `SA_RESTART` returns `EINTR` instead.
+- A process-directed signal is delivered to *any* thread that does not block it, so the
+  thread waiting on stdin is not necessarily the one the handler runs in. The handler
+  writes to a self-pipe and the waiting thread polls it (the self-pipe pattern).
+
+Measured: **the engine now exits 1.14 s after SIGTERM** (before: 30 s of holding the
+pool, then SIGKILL).
+
+**(b) The server started an engine while another one was resident.** The headroom is
+computed once, at boot, from MemAvailable; a second instance appearing later is not in
+that arithmetic, and the pool is sized to leave 8-18 GiB of slack, so one overlapping
+engine (76 GB) cannot fit. `StrataEngine.__init__` now makes room before it spawns:
+it waits until NVML lists no engine of ours (NVML lists a process until the driver has
+freed what it had), and an engine the server does not track - an orphan of an earlier
+start, which serves nothing it knows of - is ended (SIGTERM first, SIGKILL after)
+rather than left holding the pool. `tools/test_engine_room.py` covers it (6 tests).
+
+Verified live afterwards: one engine at a time in every sample, no `NV_ERR_NO_MEMORY`,
+no guard event, and a request served after a deliberate SIGTERM.
+
 ### 1. The guard's stall detector false-positives on harness-started engines
 
 At 20:51:57 and 20:57:33 the guard SIGTERMed engines that were demonstrably working:
@@ -198,17 +247,38 @@ anything.
 | 21:35–06:15 | engine serving, idle | no lock, `F:` 11.4–12.4 GiB, `N:0` |
 | 06:15–06:40 | soak against the 262144 config at headroom 40, incl. three 115k-token prefills | no lock, no guard event, `F:` min 10.02 GiB |
 | 06:43–07:07 | 262144 config re-tuned to headroom 32 + `--prefill 16384`; 115k prefills, warm decode measurements | no lock, no guard event, `F:` dip 0.73 GiB |
+| 08:01–08:15 | **the full 262144 window read**: a 239,545-token prompt | FOUND, 849 s, `F:` 17.9 GiB, `N:0`, no guard event |
+| 07:36 | the restart storm (before the fixes) | 4 engine starts in 90 s, one `NV_ERR_NO_MEMORY`, one guard kill |
+| 08:16–08:36 | after the two fixes: deliberate SIGTERM, restart, 115k-equivalent traffic | engine exits 1.14 s after SIGTERM, one engine at a time, no `N:` |
 
 Since the upgrade the box has been up **11h30m with no new boot entry** — i.e. no hard
 lock since 580.178.04 came up, against three unclean deaths on 2026-10-25 before it
 (17:11:55, 17:49:24, 18:36:48). Across 3874 guard samples since 19:00, `N:` (new NVRM
-refusals) was **0** in every single one, and the kernel log has no `Xid`, no `NVRM` error
-and no oops.
+refusals) was **0** in every single one except the 07:36 restart storm, where one
+`NV_ERR_NO_MEMORY` was recorded before the restart path was fixed - and the kernel log
+has no `Xid`, no `NVRM` error and no oops.
 
 That is consistent with the driver/firmware hypothesis in
 `.opencode/skills/gb10-hardlock-triage` §8, but it is not proof: the surviving runs used a
 different headroom (and therefore a different pool) from the runs that froze, and the
 record survival on this box was 1h45m, not 11h.
+
+## What is still open
+
+- **Admission control** — the engine still admits a prefill without checking that the
+  device has room for it, so a prompt longer than the ones measured here can still end in
+  a guard kill. The parameters are tuned for the prompts that were measured (115k and
+  239k tokens); the check that would make any prompt safe is missing. `docs/STABILITY-1.md`
+  §6.2 has the shape of it: `free >= borrow + floor` before the request is admitted turns
+  a kill into a queue.
+- **The session store moves the budget under the parameter** — restoring four 115k
+  conversations grew the pre-pool footprint by 13.6 GB, and the headroom is computed from
+  MemAvailable at boot, so a restart can turn a comfortable config into a tight one.
+  Nothing prunes the store automatically.
+- **The guard's stall detector** false-positives on engines started by another harness
+  (see above), and its NVRM rule kills the *biggest* consumer, which is not always the
+  one that failed to allocate.
+- **The stale 6.14/6.11 kernels** are still installed (see the upgrade hand-off).
 
 ## Landmines closed during the upgrade
 

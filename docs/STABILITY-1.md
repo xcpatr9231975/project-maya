@@ -125,6 +125,14 @@ appears (+12%).
 
 ## 6. Two non-parameters that also decide 256k stability
 
+0. **The restart path (fixed 2026-10-26).** The engine used to ignore SIGTERM, so the
+   guard's kill was 30 s of holding the whole pool followed by a SIGKILL; and the server
+   could start an engine while another one was resident, which does not fit on this box
+   (two pools of 65 GB in 119 GB) - the driver refused the newcomer's allocation
+   (`NV_ERR_NO_MEMORY`, the warning shot before a hard lock) and the guard then killed the
+   engine that was working. The engine now ends on SIGTERM the way QUIT does (measured:
+   1.14 s, and the pool is freed at once), and a start waits until NVML lists no engine
+   of ours. See [REGRESSION.md](../REGRESSION.md).
 1. **The session store.** Restoring four 115K conversations grew the pre-pool footprint
    `other (context, MTP, scratch, prompt path)` from 27.9 -> 42 GB (+13.6 GB)
    (`glm slots: saved a 115201-token conversation (1.61 GB); 4 kept, 3.18 GB`). Every

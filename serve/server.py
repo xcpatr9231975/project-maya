@@ -33,6 +33,7 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import struct
 import sys
@@ -67,6 +68,14 @@ try:                        # Project Maya's release (the dashboard's About; the
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
 except OSError:
     MAYA_VERSION = None
+def _proc_cmdline(pid: int) -> str:
+    """The command line of a process ("" when it is gone or unreadable)."""
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def wait_gpu_release(pid: int, timeout: float = 60.0):
     """An engine that has ended still holds its GPU memory for a few seconds - the driver frees tens of GB of VRAM and
     its pinned RAM tier after the process is gone - and an engine started at once finds the cards full (the split
@@ -520,7 +529,7 @@ class StrataEngine:
                  env: dict | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = paths.get("--native") or paths.get("--pack", "pack")
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -528,6 +537,7 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
+        self._make_room()                               # one engine at a time: two do not fit on this box
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
@@ -672,6 +682,55 @@ class StrataEngine:
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
+
+    def _engine_pids(self) -> set[int]:
+        """The pids that are running the engine binary and still hold GPU memory: NVML lists a process until the
+        driver has freed what it had, so this is "who is holding the device" and not only "who is running"."""
+        try:
+            from serve.telemetry import gpu_pids
+        except ImportError:
+            return set()
+        try:
+            pids = gpu_pids()
+        except Exception:  # noqa: BLE001 - the reader is best-effort; a start must not hang on it
+            return set()
+        if not pids:
+            return set()
+        exe = str(self.spawn[0])
+        return {pid for pid in pids if exe in _proc_cmdline(pid)}
+
+    def _make_room(self, timeout: float = 120.0, wait: float = 8.0, sigkill_after: float = 40.0):
+        """One engine at a time: a start waits until the GPU is free of our engine.  Two engines do not fit on this
+        box - one pool of 65 GB each in 119 GB of shared memory - and the newcomer that finds the device full is
+        refused by the driver (NV_ERR_NO_MEMORY), which is the warning shot before a hard lock.  So the start waits
+        for the old engine's memory to come back, and ends an engine we do not track (an orphan of an earlier start:
+        it serves nothing we know of, and it keeps the new one from fitting)."""
+        if not self._engine_pids():
+            return
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < wait and self._engine_pids():
+            time.sleep(0.5)                       # the driver frees an ended process's memory within moments
+        alive = self._engine_pids()
+        if alive:
+            print(f"[maya] an engine from an earlier start still holds the GPU (pids {sorted(alive)}); ending it",
+                  flush=True)
+            for pid in sorted(alive):
+                try:
+                    os.kill(pid, signal.SIGTERM)   # the engine ends gracefully and gives the pool back
+                except OSError:
+                    pass
+            while time.monotonic() - t0 < sigkill_after and self._engine_pids():
+                time.sleep(0.5)
+            for pid in sorted(self._engine_pids()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            while time.monotonic() - t0 < timeout and self._engine_pids():
+                time.sleep(0.5)
+        still = self._engine_pids()
+        if still:
+            print(f"[maya] the GPU still lists an engine (pids {sorted(still)}); starting anyway", flush=True)
 
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
