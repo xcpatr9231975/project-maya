@@ -13,6 +13,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
@@ -126,6 +127,26 @@ class MaxTokens(unittest.TestCase):
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
             del os.environ["STRATA_DEBUG"]
+
+    def test_a_prompt_over_the_cap_is_rejected(self):
+        """STRATA_MAX_PROMPT_TOKENS: the cap is a 400 before the engine starts reading, on both APIs, and it wins
+        over the context check."""
+        for api in ("openai", "anthropic"):
+            with self.subTest(api=api), mock.patch.dict(os.environ, {"STRATA_MAX_PROMPT_TOKENS": "5"}):
+                s, b, _, _ = self.call(api, "hello there")
+                self.assertEqual(s, 400, b)
+                self.assertIn("exceeds the prompt cap", b["error"]["message"])
+                self.assertIn("STRATA_MAX_PROMPT_TOKENS", b["error"]["message"])
+
+    def test_a_prompt_under_the_cap_runs(self):
+        with mock.patch.dict(os.environ, {"STRATA_MAX_PROMPT_TOKENS": "100000"}):
+            s, b, _, _ = self.call("openai")
+            self.assertEqual(s, 200, b)
+
+    def test_unset_the_cap_is_off(self):
+        os.environ.pop("STRATA_MAX_PROMPT_TOKENS", None)
+        s, _, _, _ = self.call("openai")
+        self.assertEqual(s, 200)
 
 
 class FitMaxTokens(unittest.TestCase):

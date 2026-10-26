@@ -11,10 +11,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import IM_END, ByteTokenizer, FairLock, Service  # noqa: E402
+from serve.server import IM_END, ByteTokenizer, FairLock, Service, admit_cooldown_seconds  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -128,6 +129,66 @@ class FairLockOrder(unittest.TestCase):
         self.assertEqual(lock.waiting(), 1)
         lock.release()
         other.join(5)
+
+
+class FairCooldown(unittest.TestCase):
+    """STRATA_ADMIT_COOLDOWN_S: a release that leaves someone waiting keeps the device idle for the cooldown before
+    that waiter's turn starts; a release nobody waited for does not, and the default (0) changes nothing."""
+
+    def lock(self, seconds):
+        return mock.patch.dict(os.environ, {"STRATA_ADMIT_COOLDOWN_S": seconds})
+
+    def test_a_waiter_starts_after_the_cooldown(self):
+        with self.lock("0.3"):
+            lock = FairLock()
+            lock.acquire()
+            turn, t = [], []
+            th = threading.Thread(target=lambda: (lock.acquire(), turn.append(1), t.append(time.monotonic()),
+                                                  lock.release()))
+            th.start()
+            while lock.waiting() < 1:
+                time.sleep(0.001)
+            t0 = time.monotonic()
+            lock.release()
+            th.join(5)
+            self.assertTrue(turn)
+            self.assertGreaterEqual(t[0] - t0, 0.25)     # the cooldown, not a spurious wake
+            self.assertLess(t[0] - t0, 2.0)
+
+    def test_a_release_nobody_waited_for_starts_at_once(self):
+        with self.lock("0.3"):
+            lock = FairLock()
+            lock.acquire()
+            lock.release()
+            t0 = time.monotonic()
+            self.assertTrue(lock.acquire())
+            self.assertLess(time.monotonic() - t0, 0.05)
+            lock.release()
+
+    def test_a_waiter_that_times_out_during_the_cooldown_leaves(self):
+        with self.lock("0.5"):
+            lock = FairLock()
+            lock.acquire()
+            done = []
+            th = threading.Thread(target=lambda: (lock.acquire(timeout=0.05), done.append(1)))
+            th.start()
+            while lock.waiting() < 1:
+                time.sleep(0.001)
+            lock.release()                               # lights the cooldown; the waiter's timeout expires first
+            th.join(5)
+            self.assertEqual(done, [1])
+            self.assertEqual(lock.waiting(), 0)
+            self.assertFalse(lock.locked())
+            self.assertTrue(lock.acquire())              # nobody queued: the fast path is not gated
+            lock.release()
+
+    def test_the_default_cooldown_is_zero(self):
+        cases = {"": 0.0, "0": 0.0, "0.25": 0.25, "-2": 0.0, "junk": 0.0}
+        for value, want in cases.items():
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"STRATA_ADMIT_COOLDOWN_S": value}):
+                self.assertEqual(admit_cooldown_seconds(), want)
+        os.environ.pop("STRATA_ADMIT_COOLDOWN_S", None)
+        self.assertEqual(admit_cooldown_seconds(), 0.0)
 
 
 class FairSlices(unittest.TestCase):

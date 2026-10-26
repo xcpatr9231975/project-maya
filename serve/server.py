@@ -12,7 +12,8 @@ data, http(s) URLs or local file paths) go through `maya-vision` (the model's mm
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.  DeepSeek-V4.1 (maya-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
 the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`.
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated, and so is
+a prompt over STRATA_MAX_PROMPT_TOKENS when that is set (0, the default: the context is the only limit).
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
@@ -216,6 +217,8 @@ class FairLock:
         self._queue: collections.deque = collections.deque()   # [token, units]
         self.capacity = max(1, int(capacity))
         self._used = 0
+        self._cooldown = admit_cooldown_seconds()
+        self._free_at = 0.0        # idle-until after a release that left someone waiting (the cooldown)
 
     def set_capacity(self, n: int):
         with self._cv:
@@ -263,13 +266,17 @@ class FairLock:
             while True:
                 if me not in self._queue:
                     return False
-                if self._queue[0] is me and self._used + min(me[1], self.capacity) <= self.capacity:
+                if (self._queue[0] is me and self._used + min(me[1], self.capacity) <= self.capacity
+                        and time.monotonic() >= self._free_at):
                     self._queue.remove(me)
                     me[1] = min(me[1], self.capacity)
                     self._used += me[1]
                     self._cv.notify_all()                   # the next in line may fit in what is left
                     return True
                 left = None if end is None else end - time.monotonic()
+                cd = self._free_at - time.monotonic()
+                if cd > 0:
+                    left = cd if left is None else min(left, cd)
                 if left is not None and left <= 0:
                     return False
                 self._cv.wait(left)
@@ -291,6 +298,8 @@ class FairLock:
                       f"{self.capacity}): the engine's conversations changed while it ran", flush=True)
                 k = self._used
             self._used -= k
+            if self._queue and self._cooldown > 0:
+                self._free_at = time.monotonic() + self._cooldown
             self._cv.notify_all()
 
     def locked(self) -> bool:
@@ -327,6 +336,29 @@ def fair_slice_seconds() -> float:
         return max(0.0, float(os.environ.get("STRATA_FAIR_SLICE_S", "0") or 0))
     except ValueError:
         return 0.0
+
+
+def admit_cooldown_seconds() -> float:
+    """STRATA_ADMIT_COOLDOWN_S: when a generation ends and at least one request is queued behind it, keep the device
+    idle this long before the next waiter's turn starts (0, the default).  Both hard locks that had a prefill anywhere
+    near sat exactly on that boundary - a long decode hands the engine straight into the next prompt's expert-staging
+    burst - and this puts GPU and disk idle between the two.  It gates only requests that were queued at the release:
+    one that finds the engine idle starts at once, and acquire(blocking=False) (the unload probe) still answers."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_ADMIT_COOLDOWN_S", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def max_prompt_tokens() -> int:
+    """STRATA_MAX_PROMPT_TOKENS: refuse a prompt longer than this many tokens with a 400 (0, the default: the context
+    is the only limit).  A prompt read re-streams the whole expert shortfall from the SSD for every chunk, so an
+    oversized prompt (an agent's tool result) is what turns the admission boundary into a burst; the cap ends it
+    before the engine starts reading."""
+    try:
+        return max(0, int(os.environ.get("STRATA_MAX_PROMPT_TOKENS", "0") or 0))
+    except ValueError:
+        return 0
 
 
 class EngineDied(RuntimeError):
@@ -2501,6 +2533,10 @@ class Service:
                 for _, (path, _) in enc:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        cap = max_prompt_tokens()
+        if cap and len(ids) > cap:
+            raise ValueError(f"prompt ({len(ids)} tokens) exceeds the prompt cap ({cap}; STRATA_MAX_PROMPT_TOKENS); "
+                             "requests are never truncated")
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
