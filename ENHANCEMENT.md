@@ -109,6 +109,31 @@ log-path resolution picked up the engine log that the bench was not writing to.
 
 ## 3. Enhancement C — a device-side cap on the slots (one translation unit)
 
+**The policy (measured 2026-10-26, for the implementation):** the caps must be *tokens AND
+bytes*, LRU-evicting, because a count alone ratchets: one 239,544-token conversation is
+**3.19 GB** of slot state, so `STRATA_GLM_SLOTS=1` still leaves 3.19 GB held, and two of
+them (6.4 GB) take headroom 40's margin to the floor. The measured bytes per token of
+slot state: **13.3 B/token** (239,544 → 3.19 GB), 14 B/token (115,201 → 1.61 GB),
+19.5 B/token (94,915 → 1.85 GB) — use **20 B/token** as the safe figure.
+
+The binding constraint is the admission gate's demand, which is **fixed** at
+`borrow + floor` = 7489 MiB on this config: the slots must keep
+`device_free ≥ 7489 + slack`. With headroom 40 the fresh margin is 17.5–25.6 GiB, so:
+
+```
+slot_bytes ≤ device_free_fresh − 7489 MiB − 2048 MiB slack ≈ 8–16 GB
+```
+
+A conservative default: **`STRATA_GLM_SLOT_BUDGET_GB = 4`** (one full-context
+conversation plus change) and **`STRATA_GLM_SLOT_TOKENS = 262144`** (one full-context
+conversation) — LRU across both. A conversation bigger than the budget is not kept at
+all: it re-reads its prompt next time (slower, not wrong). The same caps bound what is
+**restored at start** (the restore path allocates the same state).
+
+Acceptance: after N conversations of any size, `glm slots: … N kept, X GB` has
+`X ≤ 4 GB` and `N ≤ 1 for a 239k conversation`, and `F:` never drops below
+`7489 MiB + 2048 MiB` while serving.
+
 Only if A does not close the gap: the engine would refuse to **keep** a slot whose bytes
 would take the device under `free − floor` — the same rule the admission gate now uses
 for *admission*, applied to *retention*.
@@ -116,10 +141,19 @@ for *admission*, applied to *retention*.
 | | |
 |---|---|
 | the code | `src/program/generate.cpp` (the slot save/keep path, ~1441-1560) |
-| the knob | `STRATA_GLM_SLOT_BUDGET_MIB` — the bytes the slots may hold on the device; default: the headroom's slack |
+| the knob | `STRATA_GLM_SLOT_BUDGET_GB` — the bytes the slots may hold; default 4 |
 | the cost | one translation unit and a link — the 2026-10-26 rebuild of the same file took **50 s** (not the whole project) |
 | the risk | a chat that cannot be slotted re-reads its prompt (slower, not wrong) |
 | the test | the rule as a pure function (a unit test in the repo's `unittest` style) plus a live session that would have grown the footprint |
+
+**The gate's own end, closed in `cc7e9ad`:** the gate could not tell "the device is full
+of someone else's memory" (waiting helps) from "the device is full of my own held state"
+(waiting never helps) — on 2026-10-26 it burned `STRATA_GLM_ADMIT_WAIT_S` = 120 s on
+eight refusals in a row at `F: 4.03 GiB`. Now it refuses after
+`STRATA_GLM_ADMIT_STALL_S` (30 s) and the message names the cause. The server side
+waits for the *memory* to settle and retries the start the gate cannot
+(`device_free_mib()`, the settle-wait, the retry on "no room for the expert pool") —
+`d4c5f4d`.
 
 ## 4. Enhancement D — the stale 6.14/6.11 kernels (sudo)
 
