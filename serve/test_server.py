@@ -129,14 +129,19 @@ class MaxTokens(unittest.TestCase):
             del os.environ["STRATA_DEBUG"]
 
     def test_a_prompt_over_the_cap_is_rejected(self):
-        """STRATA_MAX_PROMPT_TOKENS: the cap is a 400 before the engine starts reading, on both APIs, and it wins
-        over the context check."""
+        """STRATA_MAX_PROMPT_TOKENS: the cap is a 400 before the engine starts reading, on both APIs, it wins
+        over the context check, and the refusal is logged (a 400 the log otherwise never records)."""
+        import contextlib
+        import io
         for api in ("openai", "anthropic"):
             with self.subTest(api=api), mock.patch.dict(os.environ, {"STRATA_MAX_PROMPT_TOKENS": "5"}):
-                s, b, _, _ = self.call(api, "hello there")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    s, b, _, _ = self.call(api, "hello there")
                 self.assertEqual(s, 400, b)
                 self.assertIn("exceeds the prompt cap", b["error"]["message"])
                 self.assertIn("STRATA_MAX_PROMPT_TOKENS", b["error"]["message"])
+                self.assertIn("prompt cap: refused a ", out.getvalue())
 
     def test_a_prompt_under_the_cap_runs(self):
         with mock.patch.dict(os.environ, {"STRATA_MAX_PROMPT_TOKENS": "100000"}):

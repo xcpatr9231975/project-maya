@@ -2535,6 +2535,13 @@ class Service:
             self.embeddings.path = combined
         cap = max_prompt_tokens()
         if cap and len(ids) > cap:
+            last = messages[-1] if messages else {}
+            body = last.get("content")
+            if isinstance(body, list):
+                body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
+            preview = (str(body or "")[:80]).replace("\n", " ")
+            print(f"[maya] prompt cap: refused a {len(ids):,}-token prompt (cap {cap:,}; msgs={len(messages)} "
+                  f"tools={len(tools or [])} last={last.get('role')!r}:{preview!r})", flush=True)
             raise ValueError(f"prompt ({len(ids)} tokens) exceeds the prompt cap ({cap}; STRATA_MAX_PROMPT_TOKENS); "
                              "requests are never truncated")
         room = self.engine.max_context - CTX_SLACK - len(ids)
