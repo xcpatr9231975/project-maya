@@ -189,6 +189,8 @@ grep -a "VRAM free with everything loaded" <engine log> | tail -1   # the number
 
 ## 9. Cross-references
 
+- [RECOMMENDATION-1.md](../RECOMMENDATION-1.md) -- the next-run proposal (headroom
+  40 -> 32 with the chunk held at 16384), with the 2026-10-27 9h20m run as evidence.
 - [REGRESSION.md](../REGRESSION.md) -- the full regression on driver 580.178.04, with
   the measurements behind §3 and §4
 - `docs/2026-10-25-driver-580-residual-kernels.md` -- the other open item from the
