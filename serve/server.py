@@ -4316,8 +4316,12 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_HTTP_MAX_CONNECTIONS", "STRATA_HTTP_READ_TIMEOUT_S", "STRATA_MAX_BODY_MIB",
-              "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_FAIR_SLICE_S", "STRATA_ADMIT_COOLDOWN_S", "STRATA_MAX_PROMPT_TOKENS", "STRATA_DEBUG",
+              "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
+# (the last three are the server's own reads - the admission cooldown, the prompt cap and the per-request debug
+# line: without the whitelist a config's values for them only ever reach the engine child, and the server runs
+# with the knob at its default)
 
 
 def apply_server_env(cfg: dict) -> None:
