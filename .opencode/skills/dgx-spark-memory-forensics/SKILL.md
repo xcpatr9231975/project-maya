@@ -30,9 +30,16 @@ Where to look: `~/gpu_monitor_log.txt` (samples), `~/gpu_monitor_guard.log`
 (WARN / armed / kill decisions), `~/.gpu_monitor_guard_state` (current guard
 state), `~/gpu_reports/` (per-sample reports, 7-day retention).
 
-After a hard lock the engine's own log has lost its unflushed stdio buffer as
-NUL padding, so also read `~/gpu_engine_tail.txt` — the monitor keeps a rolling
-copy of the engine's last 40 lines on every sample — and any
+After a hard lock the engine's own log is shorter than the monitor's rolling
+copy of it, and its tail is padded with NUL bytes — so also read
+`~/gpu_engine_tail.txt`, the monitor's rolling copy of the engine's last 40
+lines on every sample. (The NULs are not "lost stdio buffer": they are the ext4
+delayed-allocation hole left by the *unclean power-cycle*. The tail was still in
+the page cache, never reached the disk, and the file size survived in the journal
+without its data — which is exactly why the rolling copy has to exist. Verified
+2026-10-26 15:21: the on-disk log ended 11 lines before the monitor's 15:21:20
+capture, with 1916 trailing NULs, and `gpu_monitor.py` only ever *reads* the
+engine log.) Also read any
 `~/gpu_reports/stall_*.txt` (a stall snapshot: why, GPU/device-free readings,
 `/proc/<pid>/status`, the engine's tail) the stall guard wrote before it
 SIGTERMed the engine. A `stall:` tag in the sample line means the engine went

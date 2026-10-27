@@ -40,6 +40,20 @@ sample 11 s later and hung inside it — i.e. the GPU/`nvidia-smi` path died
 first and the kernel followed. That timestamp is the tightest bound you get on
 the freeze instant.
 
+**Count the 0-byte reports — one vs. a cluster tells you how the box died.**
+On 2026-10-25 each freeze left a *single* 0-byte report, bounding the freeze to
+one sample. The 2026-10-26 15:21 freeze left **four consecutive** ones
+(15:20:58, 15:21:02, 15:21:09, 15:21:20) spanning 22 s, while journald's last
+entry was 15:20:47.761 — i.e. journald died ~30 s *before* the monitor did, and
+the monitor's `nvidia-smi`/`/proc` queries still worked to the very end. A
+cluster means a **progressive, layered freeze** (logging first, then the write
+path, then everything), not an instant one. Mechanism: the sample line is
+appended and closed (1285-1286) *before* the report is opened (1291), and the
+report is ~743 B — under Python's 8 KiB stdio buffer — so it only lands on close.
+A 0-byte report therefore means "died between `open(rp,'w')` and close".
+Cross-check it: `print("report: …")` (1315) reaches syslog for healthy samples
+and for none of the cluster.
+
 ## 2. Evidence, in the order to read it
 
 ```bash
@@ -50,7 +64,19 @@ ls -la ~/gpu_reports/ | grep -E "17:4[89]"        # the 0-byte ones = the freeze
 tail -c 600 <engine log> | tr -d '\0'             # last flushed engine line
 dmesg | grep -iE "Power-on or device reset"       # next-boot reset cause
 ls /var/crash/                                    # a vmcore means a panic; a hard lock leaves none
+ls -la /var/crash/2*/                              # panic dmesg + vmcore are root:root 0600 -> one sudo read
+zcat /var/log/syslog.2.gz 2>/dev/null | tail -30   # deaths before the current syslog survive HERE
+tail -30 /var/log/syslog.1                         # syslog rotates at midnight; journalctl dies with the box
 ```
+
+**The rotated syslogs are the evidence journalctl cannot give you.** journald
+dies with the box and its journal ends mid-stream, but rsyslog's *files*
+(`/var/log/syslog`, `.1`, `.2.gz`…) survive the power-cycle. Two tells:
+- syslog **truncated mid-line** = an instant death;
+- **journald's last entry minutes/seconds before the monitor's last sample**
+  = a *layered* death (see §1's 0-byte-report method for the same event from
+  the monitor's side). Layered deaths: 10-25 17:49 (+19 s), 18:36 (+22 s),
+  10-26 15:21 (+33 s). Instant deaths: 10-24 21:08, 10-25 17:11:55.
 
 Files that matter:
 
@@ -90,9 +116,13 @@ Do not spend a session re-testing these:
   PSI 0%/0% at every death.
 - **Xid / driver errors** — none logged in any dead boot. The driver's kernel
   log was clean right up to each freeze.
-- **Kernel panic / oops** — zero in any dead boot; the soft-lockup detector is
-  enabled (`/proc/sys/kernel/watchdog` = 1) and never fired, so it was not even
-  a CPU stall.
+- **Kernel panic / oops** — none in any dead boot *before 2026-10-26 15:58*;
+  the soft-lockup detector is enabled (`/proc/sys/kernel/watchdog` = 1) and
+  never fired, so it was not even a CPU stall. The one 15:58 panic was an
+  **induced kdump test** (user-confirmed), not a box death — see the kdump
+  bullet. Note that a panic printk does *not* reach syslog/kern.log — rsyslog
+  dies first — so a clean `journalctl -k -b -1` no longer rules out a panic.
+  Only `/var/crash` does.
 - **WiFi (mt7925e)** — driver clean; a roaming storm was real (564 auths on
   10-25) but only 1 of 5 crashes had a wifi event within 60 s. **Fixed** by
   pinning the BSSID and disabling powersave; it was never the cause.
@@ -105,10 +135,22 @@ Do not spend a session re-testing these:
   generation finished with `cancel=True` and the next queued request's 512-token
   prefill completed — so "a new request was admitted" is *not* excluded; treat
   the prefill/pool-borrow path as in scope.
+  **Caveat on the 2026-10-26 15:58 event:** the box was idle with no maya
+  process when it died, but that panic was an *induced kdump test*
+  (user-confirmed) — so it says nothing about whether engine state matters for
+  the unexplained deaths. Treat engine/pool/load involvement as still open.
 - **Thermal / power** — 83–87 °C and 53–57 W are normal sustained load for a
   GB10; there is no spike at any freeze.
-- **kdump** — enabled and armed, but it only catches *panics*, and these
-  freezes never panic. `/var/crash` stays empty. Do not wait for a vmcore.
+- **kdump** — armed, and it **works**: an induced test panic on 2026-10-26
+  15:58 (user-confirmed, another agent) left
+  `/var/crash/202610262258/{dmesg,dump}.202610262258` (134 KB + 1.5 GB,
+  root-only) and the box **auto-rebooted ~90 s later, no human needed**. All
+  *unexplained* deaths so far were hangs, not panics, and leave `/var/crash`
+  empty — a hang is exactly the case kdump cannot catch. **Always check
+  `/var/crash` first now**; a panic's only witness is there, since the printk
+  never reaches syslog. Recovery-timing tell: ~90 s gap = kdump auto-reboot
+  after a panic (or an induced test); a multi-minute gap = a hang that needed a
+  manual power-cycle. See `docs/2026-10-26-kernel-panic-1558-idle.md`.
 
 **Read the kernel message correctly:** `watchdog: Hard watchdog permanently
 disabled` and `watchdog: NMI not fully supported` refer to the kernel's *NMI
@@ -133,6 +175,36 @@ and 4× in survival, so headroom alone is not a proven predictor — total devic
 footprint tracks survival better than the budget does. Treat this as the
 strongest available lead, not a settled cause. The alternative hypothesis is a
 driver/firmware bug (see §7).
+
+> **2026-10-26 15:21 — this lead is falsified, do not spend a session on it.**
+> That freeze ran headroom 40 GB (pool budget 55.4 GB) and held only
+> `M: 66890 MiB` = 65.3 GB on the device — the *smallest* footprint and the
+> *highest* `F:` (23.57 GiB) of any recorded death — and it froze anyway after
+> 52m29s. See `docs/2026-10-26-hardlock-1521-headroom40.md`. So neither the
+> budget nor the total footprint predicts survival, and the §6 lever is
+> exhausted: it costs ~13 % decode per step and buys nothing measurable. Do not
+> escalate headroom further on this hypothesis's strength. What *did* change:
+> the freeze followed admission of a 50,511-token prompt (see §4's "a new
+> request was admitted" note) — n=2 now, still a candidate, not a cause.
+
+## 5b. The current ranked lead: a storage/writeback stall (NVMe)
+
+From the same-evening cross-death pass (`docs/2026-10-26-hardlock-1521-headroom40.md`
+§"Follow-up investigation"): **journald dies first, the monitor's file writes
+survive +18–33 s.** Page-cache writes succeed while writeback is stalled;
+journald blocks because it is the one process that fsyncs. GPU queries keep
+working. Kernel messages cannot be persisted — so *silence in kern.log is no
+longer evidence of an instant freeze*. Stressor: the engine streams 13–16 GB
+per prefill chunk and ~25 reads/token while decoding; the disk is saturated
+whenever the engine runs, and every unexplained death happened under engine
+load. This also explains the missing vmcore at 15:21: the watchdog expires
+only once the freeze is total (systemd's loop — which pets it — stays alive
+during an I/O-only freeze), and kdump's 1.5 GB save then hangs on the same
+stalled disk. Discriminating tests, in order: **USB-UART serial logger** (the
+cmdline already has `console=ttyS0,115200`), **`kernel.hung_task_panic=1`** +
+`hung_task_all_cpu_backtrace=1` (root, runtime — turns the next stall into a
+vmcore), and **`nvme smart-log` / `nvme error-log`** (root; Samsung keeps a
+persistent controller error log across power cycles).
 
 ### Worked example — 2026-10-25 18:36:48
 
@@ -225,9 +297,17 @@ RebootWatchdogSec=30s
 
 and sets `kernel.panic=15` so a panic reboots instead of hanging.
 
-**Unproven — check it every time.** The one freeze after it was installed took
-3m42s to come back, which is manual power-cycle timing, not the expected
-30–60 s. Verify with:
+**Unproven — check it every time, and it has now failed twice.** The freeze
+after install took 3m42s to come back (manual power-cycle timing, not the
+expected 30–60 s). The 2026-10-26 15:21 freeze took **13m30s** — same story:
+the timer was armed (`active / 30 / SBSA Generic Watchdog`,
+`RuntimeWatchdogSec=30s`) and the board still needed a human. The likely
+mechanism is visible in the evidence: journald and systemd's event loop stop
+first (15:20:47), and `RuntimeWatchdogSec` is petted by that same loop, so the
+expiry should panic (WS0) and then assert the SoC reset (WS1). Neither fired.
+**Operational rule: assume a human must power-cycle; never plan around
+auto-recovery.** Why WS1 does not assert is an open work item, separate from the
+freeze cause. Verify with:
 
 ```bash
 cat /sys/class/watchdog/watchdog0/{state,timeout,identity}   # active / 30 / SBSA Generic Watchdog
@@ -235,7 +315,6 @@ grep RuntimeWatchdogSec /etc/systemd/system.conf.d/50-hardlock-watchdog.conf
 ```
 
 and compare the freeze timestamp against the next boot's first journal entry.
-
 ## 8. Getting a real root cause
 
 Ranked, cheapest first:
