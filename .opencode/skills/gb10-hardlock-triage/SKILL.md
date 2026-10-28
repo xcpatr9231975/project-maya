@@ -47,12 +47,17 @@ one sample. The 2026-10-26 15:21 freeze left **four consecutive** ones
 entry was 15:20:47.761 — i.e. journald died ~30 s *before* the monitor did, and
 the monitor's `nvidia-smi`/`/proc` queries still worked to the very end. A
 cluster means a **progressive, layered freeze** (logging first, then the write
-path, then everything), not an instant one. Mechanism: the sample line is
+path, then everything), not an instant one — and the layer order can flip: the
+2026-10-27 05:44 freeze left **two** (05:44:25, 05:44:36) while journald's last
+entry was 05:44:37, so journald *outlived* the monitor there (see §5b).
+Mechanism: the sample line is
 appended and closed (1285-1286) *before* the report is opened (1291), and the
 report is ~743 B — under Python's 8 KiB stdio buffer — so it only lands on close.
 A 0-byte report therefore means "died between `open(rp,'w')` and close".
 Cross-check it: `print("report: …")` (1315) reaches syslog for healthy samples
-and for none of the cluster.
+and for none of the cluster. 10-27 refines this: when the print *does* reach
+journald but the file is still 0 bytes, the code closed the report and the
+loss is *below* Python — dirty page cache the kernel's writeback never flushed.
 
 ## 2. Evidence, in the order to read it
 
@@ -186,6 +191,13 @@ driver/firmware bug (see §7).
 > escalate headroom further on this hypothesis's strength. What *did* change:
 > the freeze followed admission of a 50,511-token prompt (see §4's "a new
 > request was admitted" note) — n=2 now, still a candidate, not a cause.
+>
+> **2026-10-27 05:44 — falsification stands; the §6 lever is now closed.**
+> The escalated headroom-40 run survived **9 h 48 m** (longest ever) at
+> `M: 66237 MiB` and froze anyway, right after admitting a 31,011-token prompt
+> (large-prompt pattern n=3). First freeze on the *upgraded* stack (HWE kernel
+> 7.0.0-1019-nvidia + driver 580.178.04) — the §8 upgrade path is exhausted
+> too. See `docs/2026-10-27-hardlock-0544-writeback-stall.md`.
 
 ## 5b. The current ranked lead: a storage/writeback stall (NVMe)
 
@@ -205,6 +217,34 @@ cmdline already has `console=ttyS0,115200`), **`kernel.hung_task_panic=1`** +
 `hung_task_all_cpu_backtrace=1` (root, runtime — turns the next stall into a
 vmcore), and **`nvme smart-log` / `nvme error-log`** (root; Samsung keeps a
 persistent controller error log across power cycles).
+
+> **2026-10-27 05:44 — the stall was caught in the act.** The 05:44:25 sample's
+> `print("report: …")` (1315, *after* the report's close) reached journald, yet
+> the file is 0 bytes on disk — 743 B sat dirty in page cache for the ~12 s
+> until death and the kernel's 5 s writeback never flushed it, while journald's
+> fsync'd entries kept landing through 05:44:37. So at death: page-cache
+> writeback for `/home` stalled, fsync path still worked. The 05:44:36 monitor
+> instance then exited rc=0 with its stdout, sample-line append and report
+> content all lost — even journald's stdout ingest lost data in the final
+> second. Also: `kernel.hung_task_panic=1` was active from boot (sysctl.d,
+> 120 s) and did **not** fire — no D-state window precedes the total freeze, so
+> the hung-task lever cannot catch it; the UART is the only remaining witness.
+> Post-mortem `nvme smart-log` came back **clean** (`media_errors: 0`,
+> `num_err_log_entries: 0`, spare 100 %, %used 0 %) — the stall is not media
+> damage; it is the kernel write path, a silent controller/firmware wedge, or
+> the SoC/fabric. See `docs/2026-10-27-hardlock-0544-writeback-stall.md`.
+>
+> **Armed since 10-27 17:29 — check this first on the next death.** E0
+> (netconsole witness: `/etc/modprobe.d/netconsole.conf` +
+> `/etc/modules-load.d/netconsole.conf`, `network logging started`) and E1
+> (APST off: `nvme_core.default_ps_max_latency_us=0` is in the live cmdline)
+> are in place. So a freeze *after* 17:29 is **not** an APST freeze, and the
+> driver's own `I/O timeout, aborting` / `reset controller` lines should have
+> gone out over the LAN — check the receiver's log first. The receiver must be
+> another host (this box does not receive its own broadcast frames) and the
+> console is aimed at the subnet broadcast, which a switch may suppress: see
+> the doc's "Next actions". E2 (NVIDIA `0x107` interrupt coalescing) is still
+> **enabled** — the one suspect still in force.
 
 ### Worked example — 2026-10-25 18:36:48
 
@@ -297,11 +337,12 @@ RebootWatchdogSec=30s
 
 and sets `kernel.panic=15` so a panic reboots instead of hanging.
 
-**Unproven — check it every time, and it has now failed twice.** The freeze
+**Unproven — check it every time, and it has now failed three times.** The freeze
 after install took 3m42s to come back (manual power-cycle timing, not the
 expected 30–60 s). The 2026-10-26 15:21 freeze took **13m30s** — same story:
 the timer was armed (`active / 30 / SBSA Generic Watchdog`,
-`RuntimeWatchdogSec=30s`) and the board still needed a human. The likely
+`RuntimeWatchdogSec=30s`) and the board still needed a human. The 2026-10-27
+05:44 freeze took **10h23m** — the user simply found it dead later in the day. The likely
 mechanism is visible in the evidence: journald and systemd's event loop stop
 first (15:20:47), and `RuntimeWatchdogSec` is petted by that same loop, so the
 expiry should panic (WS0) and then assert the SoC reset (WS1). Neither fired.
